@@ -53,11 +53,12 @@ load_dotenv(override=True)
 # Deploy on cloud GPU providers like Cerebrium.ai for optimal performance.
 
 # Performance optimization environment variables
-os.environ["VLLM_USE_FLASHINFER"] = "1"  # Enable FlashInfer for faster inference
-os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"  # Use FlashInfer attention backend
 os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "1"  # Enable Triton Flash Attention
+os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"  # Use Flash Attention backend
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Disable for better performance
 os.environ["TORCH_USE_CUDA_DSA"] = "0"  # Disable for better performance
+os.environ["VLLM_USE_V2_BLOCK_MANAGER"] = "1"  # Use v2 block manager for better memory
+os.environ["VLLM_USE_RAY_SCHEDULER"] = "1"  # Use Ray scheduler for better performance
 
 # Setup ngrok proxy
 def setup_ngrok_proxy():
