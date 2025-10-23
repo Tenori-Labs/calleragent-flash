@@ -52,6 +52,13 @@ load_dotenv(override=True)
 # The Ultravox model is compute-intensive and performs best with GPU acceleration.
 # Deploy on cloud GPU providers like Cerebrium.ai for optimal performance.
 
+# Performance optimization environment variables
+os.environ["VLLM_USE_FLASHINFER"] = "1"  # Enable FlashInfer for faster inference
+os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"  # Use FlashInfer attention backend
+os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "1"  # Enable Triton Flash Attention
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Disable for better performance
+os.environ["TORCH_USE_CUDA_DSA"] = "0"  # Disable for better performance
+
 # Setup ngrok proxy
 def setup_ngrok_proxy():
     """Setup ngrok tunnel for telephony transport."""
@@ -297,7 +304,7 @@ class UltravoxLLMService(UltravoxSTTService):
             self._buffer.started_at = None
 
 
-# Initialize Ultravox LLM processor with system prompt
+# Initialize Ultravox LLM processor with system prompt and performance optimizations
 ultravox_llm = UltravoxLLMService(
     model_name="fixie-ai/ultravox-v0_6-llama-3_1-8b",
     hf_token=os.getenv("HF_TOKEN"),
@@ -316,6 +323,13 @@ ultravox_llm = UltravoxLLMService(
     ),
     temperature=0.7,
     max_tokens=150,
+    # Performance optimization parameters
+    gpu_memory_utilization=0.9,  # Use 90% of GPU memory for better performance
+    max_model_len=4096,  # Limit context length for faster processing
+    dtype="bfloat16",  # Use bfloat16 for better performance
+    enforce_eager=False,  # Use CUDA graphs for better performance
+    enable_chunked_prefill=True,  # Enable chunked prefill for better memory usage
+    enable_prefix_caching=True,  # Enable prefix caching for repeated patterns
 )
 
 
