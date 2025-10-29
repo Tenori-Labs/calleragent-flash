@@ -303,7 +303,7 @@ class UltravoxLLMService(UltravoxSTTService):
 
 # Initialize Ultravox LLM processor with system prompt and performance optimizations
 ultravox_llm = UltravoxLLMService(
-    model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
+    model_name="fixie-ai/ultravox-v0_6-llama-3_1-8b",
     hf_token=os.getenv("HF_TOKEN"),
     system_prompt=(
         "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words.\n"
@@ -352,9 +352,11 @@ ultravox_llm = UltravoxLLMService(
         "Assistant: ஆமா டா, சொல்லு என்ன project. நம்ம சேர்ந்து பண்ணலாம் easyஆ.\n\n"
 
         "Remember: Mix Tamil and English naturally, keep it friendly and human, like a real phone chat between buddies."
+
+        MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!
     ),
-    temperature=0.4,
-    max_tokens=150,
+    temperature=0.3,
+    max_tokens=100,
     gpu_memory_utilization=0.9,
     max_model_len=4096,
     dtype="bfloat16",
