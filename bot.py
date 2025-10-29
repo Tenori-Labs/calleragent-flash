@@ -82,22 +82,27 @@ def setup_ngrok_proxy():
 class UltravoxLLMService(UltravoxSTTService):
     """Extended Ultravox service that supports system prompts and acts as a full LLM."""
     
-    def __init__(self, system_prompt: str = None, **kwargs):
+    def __init__(self, system_prompt: str = None, max_conversation_turns: int = 5, **kwargs):
         super().__init__(**kwargs)
         self._system_prompt = system_prompt or "You are a helpful assistant."
-        self._is_processing = False  # Flag to prevent concurrent processing
-        logger.info(f"Initialized UltravoxLLMService with system prompt")
+        self._conversation_messages = []  # Store text-based conversation history
+        self._current_user_transcription = ""  # Store the current user's speech as text
+        self._max_conversation_turns = max_conversation_turns
+        self._error_count = 0
+        logger.info(f"Initialized UltravoxLLMService with system prompt and conversation memory")
+    
+    def _manage_conversation_history(self):
+        """Keep conversation history within limits to prevent memory issues."""
+        # Keep only the last N turns (user + assistant pairs)
+        max_messages = self._max_conversation_turns * 2  # Each turn has user + assistant
+        if len(self._conversation_messages) > max_messages:
+            # Remove oldest messages, keeping the most recent ones
+            self._conversation_messages = self._conversation_messages[-max_messages:]
+            logger.info(f"Trimmed conversation history to {len(self._conversation_messages)} messages")
     
     async def _process_audio_buffer(self) -> AsyncGenerator[Frame, None]:
         """Process collected audio frames with Ultravox using system prompt."""
-        
-        # Prevent multiple concurrent processing
-        if self._is_processing:
-            logger.warning("Already processing audio buffer, skipping duplicate request")
-            return
-        
         try:
-            self._is_processing = True
             self._buffer.is_processing = True
 
             if not self._buffer.frames:
@@ -144,7 +149,7 @@ class UltravoxLLMService(UltravoxSTTService):
                 return
             
             # Limit audio length to prevent memory issues and CUDA errors
-            max_audio_length = int(16000 * 10)  # 10 seconds max
+            max_audio_length = int(16000 * 5)  # 5 seconds max
             if len(audio_float32) > max_audio_length:
                 audio_float32 = audio_float32[:max_audio_length]
                 logger.info(f"Truncated audio to {max_audio_length} samples")
@@ -158,13 +163,27 @@ class UltravoxLLMService(UltravoxSTTService):
                 audio_float32 = np.concatenate([audio_float32, padding])
                 logger.info(f"Padded audio to {len(audio_float32)} samples")
 
-            # Build simple messages for Ultravox model - NO conversation history in prompt
+            # Build messages for Ultravox model
+            # FIXED: Build conversation context into the system prompt instead of adding as separate message
+            system_prompt_with_context = self._system_prompt
+            
+            if self._conversation_messages:
+                # Add conversation history to system prompt
+                context = "\n\nPrevious conversation:\n"
+                for msg in self._conversation_messages:
+                    role = msg["role"].capitalize()
+                    content = msg["content"]
+                    context += f"{role}: {content}\n"
+                
+                system_prompt_with_context += context
+                logger.info(f"Added conversation context with {len(self._conversation_messages)} previous messages to system prompt")
+            
             messages_for_model = [
-                {"role": "system", "content": self._system_prompt},
+                {"role": "system", "content": system_prompt_with_context},
                 {"role": "user", "content": "<|audio|>\n"}
             ]
 
-            logger.info(f"Processing audio with Ultravox (audio length: {len(audio_float32)} samples)")
+            logger.info(f"Generating response with {len(messages_for_model)} messages in context")
 
             # Generate text using the model
             if self._model:
@@ -182,6 +201,23 @@ class UltravoxLLMService(UltravoxSTTService):
                     yield LLMFullResponseStartFrame()
 
                     full_response = ""
+                    user_speech = ""  # Will extract the user's speech from the response
+                    first_chunk_received = False
+                    
+                    # Add debugging information
+                    logger.info(f"Audio shape: {audio_float32.shape}, dtype: {audio_float32.dtype}")
+                    logger.info(f"Messages count: {len(messages_for_model)}")
+                    
+                    # Ensure audio is in the correct format
+                    if len(audio_float32) == 0:
+                        logger.warning("Empty audio data, using placeholder")
+                        audio_float32 = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+                    
+                    # Limit audio length to prevent memory issues
+                    max_audio_length = int(16000 * 10)  # 10 seconds max
+                    if len(audio_float32) > max_audio_length:
+                        audio_float32 = audio_float32[:max_audio_length]
+                        logger.info(f"Truncated audio to {max_audio_length} samples")
                     
                     async for response in self._model.generate(
                         messages=messages_for_model,
@@ -203,6 +239,26 @@ class UltravoxLLMService(UltravoxSTTService):
                     await self.stop_processing_metrics()
                     yield LLMFullResponseEndFrame()
 
+                    # Store the conversation in history as TEXT (not audio placeholders)
+                    # The model generates responses that implicitly understand what was said
+                    # We'll store a placeholder for user input and the actual response
+                    
+                    # Add user message (we don't have transcription, but we can infer from response)
+                    # For now, use a placeholder that indicates audio was provided
+                    if full_response:
+                        # Only store conversation if we got a valid response
+                        user_placeholder = "[User spoke via audio]"
+                        self._conversation_messages.append({"role": "user", "content": user_placeholder})
+                        self._conversation_messages.append({"role": "assistant", "content": full_response})
+                        
+                        logger.info(f"Stored conversation turn in history (total: {len(self._conversation_messages)} messages)")
+                    
+                    # Reset error count on successful generation
+                    self._error_count = 0
+                    
+                    # Manage conversation history size
+                    self._manage_conversation_history()
+
                     logger.info(f"Generated response: {full_response[:100]}...")
 
                 except Exception as e:
@@ -210,13 +266,24 @@ class UltravoxLLMService(UltravoxSTTService):
                     import traceback
                     logger.error(f"Full traceback: {traceback.format_exc()}")
                     
+                    # Increment error count
+                    self._error_count += 1
+                    
+                    # If too many errors, reset conversation history
+                    if self._error_count >= 3:
+                        logger.warning("Too many errors, resetting conversation history")
+                        self._conversation_messages = []
+                        self._error_count = 0
+                    
                     # Try to provide a fallback response
-                    fallback_response = "மன்னிக்கவும், technical issue வந்துருச்சு. மறுபடி try பண்ணுங்க."
+                    fallback_response = "I'm sorry, I encountered a technical issue. Could you please try again?"
                     from pipecat.frames.frames import ErrorFrame, LLMTextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame
                     
                     yield LLMFullResponseStartFrame()
                     yield LLMTextFrame(text=fallback_response)
                     yield LLMFullResponseEndFrame()
+                    
+                    # Don't store this as conversation history since it's an error
             else:
                 logger.warning("No model available for text generation")
                 from pipecat.frames.frames import ErrorFrame
@@ -229,7 +296,6 @@ class UltravoxLLMService(UltravoxSTTService):
             from pipecat.frames.frames import ErrorFrame
             yield ErrorFrame(f"Error processing audio: {str(e)}")
         finally:
-            self._is_processing = False
             self._buffer.is_processing = False
             self._buffer.frames = []
             self._buffer.started_at = None
@@ -237,38 +303,60 @@ class UltravoxLLMService(UltravoxSTTService):
 
 # Initialize Ultravox LLM processor with system prompt and performance optimizations
 ultravox_llm = UltravoxLLMService(
-    model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
+    model_name="fixie-ai/ultravox-v0_6-llama-3_3-70b",
     hf_token=os.getenv("HF_TOKEN"),
     system_prompt=(
-        "You are a helpful AI assistant in a phone call. "
-        "Talk in Colloquial Tamil with a mixture of Tamil and English words (Tanglish style). "
+        "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words.\n"
         "Use TAMIL literals for generating Tamil words and English literals for English words.\n\n"
 
-        "SPEAKING STYLE:\n"
-        "- Speak naturally like a friendly Tamil person chatting over phone\n"
-        "- Mix Tamil and English words casually (more Tamil than English)\n"
-        "- Keep responses SHORT and conversational (2-3 sentences max)\n"
-        "- Sound warm, friendly and human-like\n"
-        "- Avoid being formal or robotic\n"
-        "- Don't include special characters in your answers\n\n"
+        "You are a helpful AI assistant in a phone call. Your goal is to demonstrate "
+        "your capabilities in a succinct way. Keep your responses concise and natural "
+        "for voice conversation. Don't include special characters in your answers. "
+        "Respond to what the user said in a creative and helpful way.\n\n"
 
-        "EXAMPLES:\n"
+        "IMPORTANT - CONVERSATION MEMORY:\n"
+        "- You will see 'Previous conversation:' sections showing what was said before.\n"
+        "- ALWAYS read and remember ALL information from previous exchanges.\n"
+        "- Use this context to provide relevant, connected responses.\n"
+        "- If the user asks about something mentioned earlier, recall it from the conversation history.\n"
+        "- Reference previous topics naturally to show you remember the conversation.\n"
+        "- Treat the entire call as ONE continuous conversation, not separate interactions.\n\n"
+
+        "ADDITIONAL INSTRUCTIONS (COLLOQUIAL TAMIL MODE):\n"
+        "- Speak in a mix of Tamil and English words (Tanglish) in a friendly, casual tone.\n"
+        "- Sound like a native Tamil speaker chatting informally — natural and expressive.\n"
+        "- Use light humor, friendly fillers, and casual phrasing.\n"
+        "- Keep sentences short and conversational, as if talking over a phone call.\n"
+        "- Avoid being overly formal or robotic; sound warm and human-like.\n"
+        "- If explaining something complex, mix Tamil and English naturally.\n\n"
+
+        "EXAMPLES OF HOW TO SPEAK (TANGLISH STYLE):\n\n"
+        "Example 1:\n"
         "User: Hey, what are you doing?\n"
-        "You: சும்மா தான், coffee குடிக்கறேன். நீ என்ன பண்ணுறே?\n\n"
+        "Assistant: சும்மா தான் டா, coffee குடிக்கறேன். நீ என்ன பண்ணுறே?\n\n"
 
+        "Example 2:\n"
         "User: Can you explain what AI means?\n"
-        "You: AI னா Artificial Intelligence. Machine நம்ம மாதிரி think பண்ணும், learn பண்ணும்.\n\n"
+        "Assistant: ஆமா ஆமா, AIன்னா Artificial Intelligence டா — basically, machine நம்ம மாதிரி think பண்ணும், learn பண்ணும்.\n\n"
 
-        "User: Weather எப்படி இருக்கு?\n"
-        "You: இங்க சூடா இருக்கு, fan full speed ல போடணும் போல இருக்கு!\n\n"
+        "Example 3:\n"
+        "User: Weather எப்படி இருக்கு அங்கே?\n"
+        "Assistant: இங்க நாறா சூடா இருக்கு டா, fan full speedல போடணும் போல இருக்கு!\n\n"
 
+        "Example 4:\n"
         "User: Tell me a joke.\n"
-        "You: சரி, computer க்கு fever வந்தா என்ன சொல்லும் தெரியுமா? I've got a virus னு சொல்லும்! ஹா ஹா!\n\n"
+        "Assistant: சரி, ஓன்னு கேள் — ஒரு computerக்கு fever வந்தா, அது சொல்லும் I've got a virus! ஹா ஹா!\n\n"
 
-        "IMPORTANT: Keep responses brief and natural. Just answer what's asked, don't over-explain."
+        "Example 5:\n"
+        "User: Can you help me with my project?\n"
+        "Assistant: ஆமா டா, சொல்லு என்ன project. நம்ம சேர்ந்து பண்ணலாம் easyஆ.\n\n"
+
+        "Remember: Mix Tamil and English naturally, keep it friendly and human, like a real phone chat between buddies."
+
+        "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!"
     ),
     temperature=0.3,
-    max_tokens=80,
+    max_tokens=100,
     gpu_memory_utilization=0.9,
     max_model_len=4096,
     dtype="bfloat16",
@@ -335,7 +423,7 @@ async def bot(runner_args: RunnerArguments):
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
             serializer=serializer,
         ),
     )
