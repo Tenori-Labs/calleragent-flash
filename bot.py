@@ -59,6 +59,8 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Disable for better performance
 os.environ["TORCH_USE_CUDA_DSA"] = "0"  # Disable for better performance
 os.environ["VLLM_USE_V2_BLOCK_MANAGER"] = "1"  # Use v2 block manager for better memory
 os.environ["VLLM_USE_RAY_SCHEDULER"] = "1"  # Use Ray scheduler for better performance
+os.environ["VLLM_GPU_MEMORY_UTILIZATION"] = "0.9"  # Use 90% of GPU memory
+os.environ["VLLM_MAX_MODEL_LEN"] = "4096"  # Limit context length for faster processing
 
 # Setup ngrok proxy
 def setup_ngrok_proxy():
@@ -305,13 +307,13 @@ class UltravoxLLMService(UltravoxSTTService):
             self._buffer.started_at = None
 
 
-# Initialize Ultravox LLM processor with system prompt and performance optimizations
+# Initialize Ultravox LLM processor with system prompt
 ultravox_llm = UltravoxLLMService(
     model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
     hf_token=os.getenv("HF_TOKEN"),
     system_prompt=(
-        "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words."
-        "Use TAMIL literals for generating tamil words and English literals for English words"
+        "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words. "
+        "Use TAMIL literals for generating tamil words and English literals for English words. "
         "You are a helpful AI assistant in a phone call. Your goal is to demonstrate "
         "your capabilities in a succinct way. Keep your responses concise and natural "
         "for voice conversation. Don't include special characters in your answers. "
@@ -322,7 +324,7 @@ ultravox_llm = UltravoxLLMService(
         "- Use this context to provide relevant, connected responses\n"
         "- If the user asks about something mentioned earlier, recall it from the conversation history\n"
         "- Reference previous topics naturally to show you remember the conversation\n"
-        "- Treat the entire call as ONE continuous conversation, not separate interactions"
+        "- Treat the entire call as ONE continuous conversation, not separate interactions\n\n"
         "ADDITIONAL INSTRUCTIONS (COLLOQUIAL TAMIL MODE):\n"
         "- Speak in a mix of Tamil and English words (Tanglish) in a friendly, casual tone.\n"
         "- Sound like a native Tamil speaker chatting informally — natural and expressive.\n"
@@ -333,13 +335,6 @@ ultravox_llm = UltravoxLLMService(
     ),
     temperature=0.4,
     max_tokens=150,
-    # Performance optimization parameters
-    gpu_memory_utilization=0.9,  # Use 90% of GPU memory for better performance
-    max_model_len=4096,  # Limit context length for faster processing
-    dtype="bfloat16",  # Use bfloat16 for better performance
-    enforce_eager=False,  # Use CUDA graphs for better performance
-    enable_chunked_prefill=True,  # Enable chunked prefill for better memory usage
-    enable_prefix_caching=True,  # Enable prefix caching for repeated patterns
 )
 
 
