@@ -164,28 +164,24 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.info(f"Padded audio to {len(audio_float32)} samples")
 
             # Build messages for Ultravox model
-            # For the FIRST pass, we only send the audio to get transcription + response
-            messages_for_model = [
-                {"role": "system", "content": self._system_prompt}
-            ]
+            # FIXED: Build conversation context into the system prompt instead of adding as separate message
+            system_prompt_with_context = self._system_prompt
             
-            # Add text-based conversation history (without audio placeholders)
             if self._conversation_messages:
-                # Add the conversation context as a single system message to avoid CUDA issues
-                conversation_context = "Previous conversation:\n"
+                # Add conversation history to system prompt
+                context = "\n\nPrevious conversation:\n"
                 for msg in self._conversation_messages:
                     role = msg["role"].capitalize()
                     content = msg["content"]
-                    conversation_context += f"{role}: {content}\n"
+                    context += f"{role}: {content}\n"
                 
-                messages_for_model.append({
-                    "role": "system",
-                    "content": conversation_context
-                })
-                logger.info(f"Added conversation context with {len(self._conversation_messages)} previous messages")
+                system_prompt_with_context += context
+                logger.info(f"Added conversation context with {len(self._conversation_messages)} previous messages to system prompt")
             
-            # Add current audio input
-            messages_for_model.append({"role": "user", "content": "<|audio|>\n"})
+            messages_for_model = [
+                {"role": "system", "content": system_prompt_with_context},
+                {"role": "user", "content": "<|audio|>\n"}
+            ]
 
             logger.info(f"Generating response with {len(messages_for_model)} messages in context")
 
