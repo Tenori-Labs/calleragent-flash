@@ -38,7 +38,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.exotel import ExotelFrameSerializer
-from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.ultravox.stt import UltravoxSTTService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.websocket.fastapi import (
@@ -345,7 +345,7 @@ ultravox_llm = UltravoxLLMService(
 
         "Example 4:\n"
         "User: Tell me a joke.\n"
-        "Assistant: சரி, ஓன்னு கேள் — ஒரு computerக்கு fever வந்தா, அது சொல்லும் I’ve got a virus! ஹா ஹா!\n\n"
+        "Assistant: சரி, ஓன்னு கேள் — ஒரு computerக்கு fever வந்தா, அது சொல்லும் I've got a virus! ஹா ஹா!\n\n"
 
         "Example 5:\n"
         "User: Can you help me with my project?\n"
@@ -366,10 +366,10 @@ ultravox_llm = UltravoxLLMService(
 )
 
 async def run_bot(transport: BaseTransport, handle_sigint: bool):
-    # Initialize Cartesia TTS service
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    # Initialize ElevenLabs TTS service
+    tts = ElevenLabsTTSService(
+        api_key=os.getenv("ELEVENLABS_API_KEY"),
+        voice_id="C2RGMrNBTZaNfddRPeRH",
     )
 
     # Create pipeline with Ultravox as the central multimodal LLM
@@ -377,7 +377,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
         [
             transport.input(),  # Websocket input from Exotel
             ultravox_llm,  # Ultravox processes audio and generates intelligent responses
-            tts,  # Text-To-Speech (Cartesia)
+            tts,  # Text-To-Speech (ElevenLabs)
             transport.output(),  # Websocket output to Exotel
         ]
     )
