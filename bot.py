@@ -353,7 +353,7 @@ ultravox_llm = UltravoxLLMService(
 
         "Remember: Mix Tamil and English naturally, keep it friendly and human, like a real phone chat between buddies."
 
-        MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!
+        "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!"
     ),
     temperature=0.3,
     max_tokens=100,
