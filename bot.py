@@ -357,8 +357,8 @@ ultravox_llm = UltravoxLLMService(
         "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!\n\n"
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated\n\n"
     ),
-    temperature=0.3,
-    max_tokens=50,
+    temperature=0.6,
+    max_tokens=150,
     gpu_memory_utilization=0.9,
     max_model_len=4096,
     dtype="bfloat16",
