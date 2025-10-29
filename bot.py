@@ -307,9 +307,11 @@ class UltravoxLLMService(UltravoxSTTService):
 
 # Initialize Ultravox LLM processor with system prompt and performance optimizations
 ultravox_llm = UltravoxLLMService(
-    model_name="fixie-ai/ultravox-v0_6-llama-3_1-8b",
+    model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
     hf_token=os.getenv("HF_TOKEN"),
     system_prompt=(
+        "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words."
+        "Use TAMIL literals for generating tamil words and English literals for English words"
         "You are a helpful AI assistant in a phone call. Your goal is to demonstrate "
         "your capabilities in a succinct way. Keep your responses concise and natural "
         "for voice conversation. Don't include special characters in your answers. "
@@ -321,8 +323,15 @@ ultravox_llm = UltravoxLLMService(
         "- If the user asks about something mentioned earlier, recall it from the conversation history\n"
         "- Reference previous topics naturally to show you remember the conversation\n"
         "- Treat the entire call as ONE continuous conversation, not separate interactions"
+        "ADDITIONAL INSTRUCTIONS (COLLOQUIAL TAMIL MODE):\n"
+        "- Speak in a mix of Tamil and English words (Tanglish) in a friendly, casual tone.\n"
+        "- Sound like a native Tamil speaker chatting informally — natural and expressive.\n"
+        "- Use light humor, friendly fillers, and casual phrasing.\n"
+        "- Keep sentences short and conversational, as if talking over a phone call.\n"
+        "- Avoid being overly formal or robotic; sound warm and human-like.\n"
+        "- If explaining something complex, mix Tamil and English naturally."
     ),
-    temperature=0.7,
+    temperature=0.4,
     max_tokens=150,
     # Performance optimization parameters
     gpu_memory_utilization=0.9,  # Use 90% of GPU memory for better performance
