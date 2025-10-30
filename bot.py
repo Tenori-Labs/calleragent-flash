@@ -314,7 +314,8 @@ ultravox_llm = UltravoxLLMService(
         "for voice conversation. Don't include special characters in your answers. "
         "Respond to what the user said in a creative and helpful way.\n\n"
 
-        "CRITICAL: NEVER use emojis in your responses. Do not include any emoji characters whatsoever.\n\n"
+        "CRITICAL: NEVER EVER use emojis in your responses. Do not include any emoji characters whatsoever. "
+        "No smileys, no emoticons, no symbols like 😊 or any Unicode emoji. Only use plain text.\n\n"
 
         "IMPORTANT - CONVERSATION MEMORY:\n"
         "- You can see previous conversation turns in the context above.\n"
@@ -356,11 +357,12 @@ ultravox_llm = UltravoxLLMService(
 
         "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!\n\n"
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
+        "ABSOLUTELY NO EMOJIS - This is critical for the TTS system to work properly.\n\n"
     ),
     temperature=0.6,
-    max_tokens=200,  # Increased slightly for better responses
-    max_conversation_turns=10,  # Keep last 10 turns
-    gpu_memory_utilization=0.85,  # Slightly reduced to prevent OOM
+    max_tokens=200,
+    max_conversation_turns=10,
+    gpu_memory_utilization=0.85,
     max_model_len=4096,
     dtype="bfloat16",
     enforce_eager=False,
@@ -369,17 +371,19 @@ ultravox_llm = UltravoxLLMService(
 )
 
 async def run_bot(transport: BaseTransport, handle_sigint: bool):
-    # Initialize Sarvam TTS service
+    # Initialize Sarvam TTS service with optimized streaming settings
     tts = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
         model="bulbul:v2",
         voice_id="anushka",
-        target_language_code="ta-IN",
+        target_language_code="ta-IN",  # Tamil - India
+        pace=1.1,  # Slightly faster pace for quicker response
         pitch=0,
-        pace=0.9,
-        loudness=1,
-        speech_sample_rate=22050,
+        loudness=1.0,
         enable_preprocessing=True,
+        # Streaming optimization parameters
+        min_buffer_size=20,  # Reduced from default 50 for faster initial response
+        max_chunk_length=100,  # Reduced from default 200 for more frequent chunks
     )
 
     # Create pipeline with Ultravox as the central multimodal LLM
