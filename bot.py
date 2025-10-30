@@ -38,7 +38,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.exotel import ExotelFrameSerializer
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.services.ultravox.stt import UltravoxSTTService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.websocket.fastapi import (
@@ -314,6 +314,8 @@ ultravox_llm = UltravoxLLMService(
         "for voice conversation. Don't include special characters in your answers. "
         "Respond to what the user said in a creative and helpful way.\n\n"
 
+        "CRITICAL: NEVER use emojis in your responses. Do not include any emoji characters whatsoever.\n\n"
+
         "IMPORTANT - CONVERSATION MEMORY:\n"
         "- You can see previous conversation turns in the context above.\n"
         "- ALWAYS remember and reference information from earlier in the conversation.\n"
@@ -367,10 +369,17 @@ ultravox_llm = UltravoxLLMService(
 )
 
 async def run_bot(transport: BaseTransport, handle_sigint: bool):
-    # Initialize ElevenLabs TTS service
-    tts = ElevenLabsTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        voice_id="C2RGMrNBTZaNfddRPeRH",
+    # Initialize Sarvam TTS service
+    tts = SarvamTTSService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        model="bulbul:v2",
+        voice_id="anushka",
+        target_language_code="ta-IN",
+        pitch=0,
+        pace=0.9,
+        loudness=1,
+        speech_sample_rate=22050,
+        enable_preprocessing=True,
     )
 
     # Create pipeline with Ultravox as the central multimodal LLM
@@ -378,7 +387,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
         [
             transport.input(),  # Websocket input from Exotel
             ultravox_llm,  # Ultravox processes audio and generates intelligent responses
-            tts,  # Text-To-Speech (ElevenLabs)
+            tts,  # Text-To-Speech (Sarvam)
             transport.output(),  # Websocket output to Exotel
         ]
     )
@@ -395,7 +404,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info("Client connected to Exotel bot with Ultravox LLM")
+        logger.info("Client connected to Exotel bot with Ultravox LLM and Sarvam TTS")
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
