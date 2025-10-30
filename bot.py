@@ -27,16 +27,14 @@ from dotenv import load_dotenv
 from loguru import logger
 from pyngrok import ngrok
 import uvicorn
-import torch
-import numpy as np
 from fastapi import FastAPI, WebSocket
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams, VADState
-from pipecat.frames.frames import Frame, LLMMessagesFrame, AudioRawFrame
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import Frame, LLMMessagesFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.exotel import ExotelFrameSerializer
@@ -81,174 +79,15 @@ def setup_ngrok_proxy():
     return proxy_url
 
 
-class UltraVADAnalyzer:
-    """Context-aware VAD using UltraVAD model for better turn-taking detection."""
-    
-    def __init__(self, threshold: float = 0.15, device: str = None):
-        """
-        Initialize UltraVAD analyzer.
-        
-        Args:
-            threshold: Probability threshold for end-of-turn detection (0.1-0.2 recommended)
-            device: Device to run model on ('cuda' or 'cpu')
-        """
-        self._threshold = threshold
-        self._device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self._conversation_turns = []
-        self._pipeline = None
-        self._model_loaded = False
-        
-        logger.info(f"Initializing UltraVAD with threshold={threshold}, device={self._device}")
-        
-        # Lazy load the model
-        self._load_model()
-    
-    def _load_model(self):
-        """Load UltraVAD model pipeline."""
-        try:
-            import transformers
-            
-            logger.info("Loading UltraVAD model (fixie-ai/ultraVAD)...")
-            self._pipeline = transformers.pipeline(
-                model='fixie-ai/ultraVAD',
-                trust_remote_code=True,
-                device=self._device
-            )
-            self._model_loaded = True
-            logger.info("UltraVAD model loaded successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to load UltraVAD model: {e}")
-            logger.warning("Falling back to basic VAD behavior")
-            self._model_loaded = False
-    
-    def update_conversation_context(self, role: str, content: str):
-        """Update conversation history for context-aware endpointing."""
-        self._conversation_turns.append({
-            "role": role,
-            "content": content
-        })
-        
-        # Keep only last 5 turns for efficiency
-        if len(self._conversation_turns) > 5:
-            self._conversation_turns = self._conversation_turns[-5:]
-        
-        logger.debug(f"Updated UltraVAD context: {len(self._conversation_turns)} turns")
-    
-    def check_end_of_turn(self, audio_array: np.ndarray, sample_rate: int = 16000) -> tuple[bool, float]:
-        """
-        Check if the speaker has finished their turn.
-        
-        Args:
-            audio_array: Audio data as float32 numpy array
-            sample_rate: Sample rate (default 16000)
-        
-        Returns:
-            Tuple of (is_end_of_turn, probability)
-        """
-        if not self._model_loaded or self._pipeline is None:
-            # Fallback: simple silence detection
-            return True, 1.0
-        
-        try:
-            # Ensure audio is float32
-            if audio_array.dtype != np.float32:
-                audio_array = audio_array.astype(np.float32)
-            
-            # Build model inputs
-            inputs = {
-                "audio": audio_array,
-                "turns": self._conversation_turns.copy() if self._conversation_turns else [],
-                "sampling_rate": sample_rate
-            }
-            
-            # Preprocess
-            model_inputs = self._pipeline.preprocess(inputs)
-            
-            # Move to device
-            device = next(self._pipeline.model.parameters()).device
-            model_inputs = {
-                k: (v.to(device) if hasattr(v, "to") else v) 
-                for k, v in model_inputs.items()
-            }
-            
-            # Forward pass
-            with torch.inference_mode():
-                output = self._pipeline.model.forward(**model_inputs, return_dict=True)
-            
-            # Get logits at last audio position
-            logits = output.logits  # (1, seq_len, vocab)
-            audio_pos = int(
-                model_inputs["audio_token_start_idx"].item() +
-                model_inputs["audio_token_len"].item() - 1
-            )
-            
-            # Get <|eot_id|> token probability
-            token_id = self._pipeline.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-            if token_id is None or token_id == self._pipeline.tokenizer.unk_token_id:
-                logger.warning("<|eot_id|> token not found, using fallback")
-                return True, 1.0
-            
-            audio_logits = logits[0, audio_pos, :]
-            audio_probs = torch.softmax(audio_logits.float(), dim=-1)
-            eot_prob = audio_probs[token_id].item()
-            
-            is_eot = eot_prob > self._threshold
-            
-            logger.debug(f"UltraVAD: P(EOT)={eot_prob:.4f}, threshold={self._threshold}, is_EOT={is_eot}")
-            
-            return is_eot, eot_prob
-            
-        except Exception as e:
-            logger.error(f"Error in UltraVAD check: {e}")
-            # Fallback to assuming end of turn
-            return True, 1.0
-
-
-class HybridVADProcessor(FrameProcessor):
-    """
-    Hybrid VAD that combines Silero (for initial silence detection) 
-    with UltraVAD (for context-aware turn-taking).
-    """
-    
-    def __init__(self, silero_vad: SileroVADAnalyzer, ultravad: UltraVADAnalyzer):
-        super().__init__()
-        self._silero = silero_vad
-        self._ultravad = ultravad
-        self._audio_buffer = []
-        self._sample_rate = 16000
-        self._checking_eot = False
-        
-        logger.info("Initialized HybridVADProcessor with Silero + UltraVAD")
-    
-    def update_conversation_context(self, role: str, content: str):
-        """Update UltraVAD conversation context."""
-        self._ultravad.update_conversation_context(role, content)
-    
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Process frames and apply hybrid VAD logic."""
-        await super().process_frame(frame, direction)
-        
-        # Pass through all frames
-        await self.push_frame(frame, direction)
-
-
 class UltravoxLLMService(UltravoxSTTService):
     """Extended Ultravox service that supports system prompts and acts as a full LLM with conversation memory."""
     
-    def __init__(
-        self, 
-        system_prompt: str = None, 
-        max_conversation_turns: int = 10,
-        ultravad_analyzer: UltraVADAnalyzer = None,
-        **kwargs
-    ):
+    def __init__(self, system_prompt: str = None, max_conversation_turns: int = 10, **kwargs):
         super().__init__(**kwargs)
         self._system_prompt = system_prompt or "You are a helpful assistant."
         self._conversation_history = []  # Store structured conversation turns
         self._max_conversation_turns = max_conversation_turns
         self._error_count = 0
-        self._ultravad = ultravad_analyzer
         logger.info(f"Initialized UltravoxLLMService with conversation memory (max {max_conversation_turns} turns)")
     
     def _manage_conversation_history(self):
@@ -261,6 +100,8 @@ class UltravoxLLMService(UltravoxSTTService):
     
     def _build_context_messages(self, audio_float32):
         """Build the message list for Ultravox with conversation history."""
+        import numpy as np
+        
         # Start with system prompt that includes conversation context
         if self._conversation_history:
             # Build a text summary of previous conversation
@@ -294,6 +135,7 @@ class UltravoxLLMService(UltravoxSTTService):
                 return
 
             # Process audio frames with minimal manipulation to preserve quality
+            import numpy as np
             audio_arrays = []
             
             for f in self._buffer.frames:
@@ -323,14 +165,6 @@ class UltravoxLLMService(UltravoxSTTService):
             # Convert to float32 for the model (normalize properly)
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
             
-            # Use UltraVAD to check if this is really end of turn
-            if self._ultravad:
-                is_eot, eot_prob = self._ultravad.check_end_of_turn(audio_float32, sample_rate=16000)
-                if not is_eot:
-                    logger.info(f"UltraVAD: Not end of turn (prob={eot_prob:.4f}), skipping response")
-                    return
-                logger.info(f"UltraVAD: Confirmed end of turn (prob={eot_prob:.4f}), proceeding with response")
-            
             # Validate audio data
             if len(audio_float32) == 0:
                 logger.warning("Empty audio data, skipping processing")
@@ -345,8 +179,8 @@ class UltravoxLLMService(UltravoxSTTService):
             audio_float32 = np.clip(audio_float32, -1.0, 1.0)
             
             # More reasonable length limits - don't cut speech too aggressively
-            max_audio_length = int(16000 * 15)  # 15 seconds max
-            min_audio_length = int(16000 * 0.3)  # 0.3 seconds min
+            max_audio_length = int(16000 * 15)  # 15 seconds max (increased from 5)
+            min_audio_length = int(16000 * 0.3)  # 0.3 seconds min (decreased from 0.5)
             
             if len(audio_float32) > max_audio_length:
                 logger.warning(f"Audio too long ({len(audio_float32)/16000:.1f}s), truncating to {max_audio_length/16000:.1f}s")
@@ -401,20 +235,22 @@ class UltravoxLLMService(UltravoxSTTService):
                     await self.stop_processing_metrics()
                     yield LLMFullResponseEndFrame()
 
-                    # Store conversation turn and update UltraVAD context
+                    # Extract user transcription and store conversation turn
+                    # Ultravox implicitly transcribes the audio and responds to it
+                    # We can infer what the user said from the context, but for a proper
+                    # conversation history, we should note that audio was provided
+                    
                     if full_response.strip():
+                        # For better conversation tracking, we create a placeholder
+                        # In a production system, you might want to use a separate STT service
+                        # to get the actual transcription for history
                         user_speech_placeholder = "[Audio input received]"
                         
-                        # Store in conversation history
+                        # Store the conversation turn
                         self._conversation_history.append({
                             "user": user_speech_placeholder,
                             "assistant": full_response.strip()
                         })
-                        
-                        # Update UltraVAD context
-                        if self._ultravad:
-                            self._ultravad.update_conversation_context("user", user_speech_placeholder)
-                            self._ultravad.update_conversation_context("assistant", full_response.strip())
                         
                         logger.info(f"Stored conversation turn. Total history: {len(self._conversation_history)} turns")
                         logger.info(f"Assistant response: {full_response[:100]}...")
@@ -464,17 +300,10 @@ class UltravoxLLMService(UltravoxSTTService):
             self._buffer.started_at = None
 
 
-# Initialize UltraVAD analyzer
-ultravad_analyzer = UltraVADAnalyzer(
-    threshold=0.15,  # Start with 0.15, adjust higher if interrupting too much
-    device='cuda' if torch.cuda.is_available() else 'cpu'
-)
-
 # Initialize Ultravox LLM processor with system prompt and performance optimizations
 ultravox_llm = UltravoxLLMService(
     model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
     hf_token=os.getenv("HF_TOKEN"),
-    ultravad_analyzer=ultravad_analyzer,
     system_prompt=(
         "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words.\n"
         "Speak in an EXTREMELY CONCISE manner.\n"
@@ -527,9 +356,9 @@ ultravox_llm = UltravoxLLMService(
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
     ),
     temperature=0.6,
-    max_tokens=200,
-    max_conversation_turns=10,
-    gpu_memory_utilization=0.85,
+    max_tokens=200,  # Increased slightly for better responses
+    max_conversation_turns=10,  # Keep last 10 turns
+    gpu_memory_utilization=0.85,  # Slightly reduced to prevent OOM
     max_model_len=4096,
     dtype="bfloat16",
     enforce_eager=False,
@@ -566,7 +395,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info("Client connected to Exotel bot with Ultravox LLM + UltraVAD")
+        logger.info("Client connected to Exotel bot with Ultravox LLM")
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -589,7 +418,7 @@ async def bot(runner_args: RunnerArguments):
         call_sid=call_data["call_id"],
     )
 
-    # Use Silero for initial silence detection, UltraVAD will refine
+    # IMPROVED VAD settings - less aggressive to avoid cutting off speech
     transport = FastAPIWebsocketTransport(
         websocket=runner_args.websocket,
         params=FastAPIWebsocketParams(
@@ -598,8 +427,8 @@ async def bot(runner_args: RunnerArguments):
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.7,  # Longer pause detection - UltraVAD will refine
-                    min_volume=0.6,
+                    stop_secs=0.5,  # Increased from 0.2 to avoid cutting off speech
+                    min_volume=0.6,  # Lower threshold for better sensitivity
                 )
             ),
             serializer=serializer,
