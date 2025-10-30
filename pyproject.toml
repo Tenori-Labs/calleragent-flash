@@ -13,7 +13,5 @@ dependencies = [
   "numpy>=1.21.0",
   "pyngrok>=7.0.0",
   "uvicorn>=0.24.0",
-  "fastapi>=0.104.0",
-  "accelerate>=0.20.0",
-  "peft>=0.4.0"
+  "fastapi>=0.104.0"
 ]
