@@ -359,7 +359,7 @@ ultravox_llm = UltravoxLLMService(
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
         "ABSOLUTELY NO EMOJIS - This is critical for the TTS system to work properly.\n\n"
     ),
-    temperature=0.6,
+    temperature=0.3,
     max_tokens=200,
     max_conversation_turns=10,
     gpu_memory_utilization=0.85,
