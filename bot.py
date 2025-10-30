@@ -28,31 +28,23 @@ from loguru import logger
 from pyngrok import ngrok
 import uvicorn
 from fastapi import FastAPI, WebSocket
-import numpy as np
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import Frame, LLMMessagesFrame
-from pipecat.frames.frames import (
-    LLMTextFrame,
-    LLMFullResponseStartFrame,
-    LLMFullResponseEndFrame,
-    AudioRawFrame,
-)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.exotel import ExotelFrameSerializer
+from pipecat.services.sarvam.tts import SarvamTTSService
 from pipecat.services.ultravox.stt import UltravoxSTTService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-from transformers import AutoTokenizer
-from parler_tts import ParlerTTSForConditionalGeneration
 
 load_dotenv(override=True)
 
@@ -308,107 +300,6 @@ class UltravoxLLMService(UltravoxSTTService):
             self._buffer.started_at = None
 
 
-# ---------------- Indic Parler TTS (streaming on LLM text chunks) ----------------
-class IndicParlerTTSService(FrameProcessor):
-    """Minimal TTS processor that turns LLM text chunks into PCM16 audio frames.
-
-    - Uses ai4bharat/indic-parler-tts
-    - Generates per text chunk to enable streaming playback
-    - Resamples model output to 16 kHz mono PCM16 for telephony
-    """
-
-    def __init__(self, model_name: str = "ai4bharat/indic-parler-tts", device: str | None = None, speaker_description: str | None = None):
-        super().__init__()
-        self.device = device or ("cuda:0" if (hasattr(np, "__version__") and __import__("torch").cuda.is_available()) else "cpu")
-
-        # Load TTS model/tokenizers
-        self.model = ParlerTTSForConditionalGeneration.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-        ).to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.description_tokenizer = AutoTokenizer.from_pretrained(
-            self.model.config.text_encoder._name_or_path
-            , trust_remote_code=True
-        )
-
-        # Voice prompt/description
-        self.description = speaker_description or (
-            "Tamil female Jaya, a friendly native Tamil speaker. Warm, expressive, "
-            "clear tone, fast pitch, natural rhythm, studio-quality close mic recording."
-        )
-
-        # Cache sampling rate
-        self.model_sampling_rate = int(getattr(self.model.config, "sampling_rate", 24000))
-
-    def _tts_generate_audio(self, text: str) -> np.ndarray:
-        if not text or not text.strip():
-            return np.zeros(0, dtype=np.float32)
-
-        description_inputs = self.description_tokenizer(self.description, return_tensors="pt").to(self.device)
-        prompt_inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-
-        import torch
-        with torch.inference_mode():
-            generation = self.model.generate(
-                input_ids=description_inputs.input_ids,
-                attention_mask=description_inputs.attention_mask,
-                prompt_input_ids=prompt_inputs.input_ids,
-                prompt_attention_mask=prompt_inputs.attention_mask,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                use_cache=True,
-                max_new_tokens=70000,
-            )
-
-        audio = generation.cpu().numpy().squeeze().astype(np.float32)
-        if audio.ndim > 1:
-            audio = audio.reshape(-1)
-
-        # Trim slight tail as in example
-        trim = int(len(audio) * 0.02)
-        if trim > 0:
-            audio = audio[:-trim]
-        return audio
-
-    @staticmethod
-    def _resample_to_16k(audio: np.ndarray, src_rate: int) -> np.ndarray:
-        if src_rate == 16000 or audio.size == 0:
-            return audio
-        # Simple linear resample to 16 kHz to avoid extra deps
-        src_len = audio.shape[0]
-        dst_len = int(round(src_len * 16000 / src_rate))
-        if dst_len <= 0:
-            return np.zeros(0, dtype=np.float32)
-        x = np.linspace(0.0, 1.0, num=src_len, endpoint=False)
-        xi = np.linspace(0.0, 1.0, num=dst_len, endpoint=False)
-        return np.interp(xi, x, audio).astype(np.float32)
-
-    @staticmethod
-    def _float32_to_int16(audio_f32: np.ndarray) -> np.ndarray:
-        if audio_f32.size == 0:
-            return np.zeros(0, dtype=np.int16)
-        audio_f32 = np.clip(audio_f32, -1.0, 1.0)
-        return (audio_f32 * 32767.0).astype(np.int16)
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # Pass-through non-LLM frames
-        if isinstance(frame, LLMFullResponseStartFrame):
-            return []
-        if isinstance(frame, LLMFullResponseEndFrame):
-            return []
-        if isinstance(frame, LLMTextFrame):
-            # Generate per-chunk audio
-            text_chunk = frame.text
-            audio_f32 = self._tts_generate_audio(text_chunk)
-            audio_16k_f32 = self._resample_to_16k(audio_f32, self.model_sampling_rate)
-            pcm16 = self._float32_to_int16(audio_16k_f32)
-            if pcm16.size == 0:
-                return []
-            return [AudioRawFrame(audio=pcm16, sample_rate=16000)]
-        return []
-
 # Initialize Ultravox LLM processor with system prompt and performance optimizations
 ultravox_llm = UltravoxLLMService(
     model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
@@ -422,6 +313,9 @@ ultravox_llm = UltravoxLLMService(
         "your capabilities in a succinct way. Keep your responses concise and natural "
         "for voice conversation. Don't include special characters in your answers. "
         "Respond to what the user said in a creative and helpful way.\n\n"
+
+        "CRITICAL: NEVER EVER use emojis in your responses. Do not include any emoji characters whatsoever. "
+        "No smileys, no emoticons, no symbols like 😊 or any Unicode emoji. Only use plain text.\n\n"
 
         "IMPORTANT - CONVERSATION MEMORY:\n"
         "- You can see previous conversation turns in the context above.\n"
@@ -463,11 +357,12 @@ ultravox_llm = UltravoxLLMService(
 
         "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!\n\n"
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
+        "ABSOLUTELY NO EMOJIS - This is critical for the TTS system to work properly.\n\n"
     ),
-    temperature=0.6,
-    max_tokens=200,  # Increased slightly for better responses
-    max_conversation_turns=10,  # Keep last 10 turns
-    gpu_memory_utilization=0.85,  # Slightly reduced to prevent OOM
+    temperature=0.3,
+    max_tokens=200,
+    max_conversation_turns=10,
+    gpu_memory_utilization=0.85,
     max_model_len=4096,
     dtype="bfloat16",
     enforce_eager=False,
@@ -476,14 +371,19 @@ ultravox_llm = UltravoxLLMService(
 )
 
 async def run_bot(transport: BaseTransport, handle_sigint: bool):
-    # Initialize Indic Parler TTS (replaces ElevenLabs)
-    tts = IndicParlerTTSService(
-        model_name="ai4bharat/indic-parler-tts",
-        device=None,
-        speaker_description=(
-            "Tamil female Jaya, a friendly native Tamil speaker. Warm, expressive, "
-            "clear tone, fast pitch, natural rhythm, studio-quality close mic recording."
-        ),
+    # Initialize Sarvam TTS service with optimized streaming settings
+    tts = SarvamTTSService(
+        api_key=os.getenv("SARVAM_API_KEY"),
+        model="bulbul:v2",
+        voice_id="anushka",
+        target_language_code="ta-IN",  # Tamil - India
+        pace=1.1,  # Slightly faster pace for quicker response
+        pitch=0,
+        loudness=1.0,
+        enable_preprocessing=True,
+        # Streaming optimization parameters
+        min_buffer_size=20,  # Reduced from default 50 for faster initial response
+        max_chunk_length=100,  # Reduced from default 200 for more frequent chunks
     )
 
     # Create pipeline with Ultravox as the central multimodal LLM
@@ -491,7 +391,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
         [
             transport.input(),  # Websocket input from Exotel
             ultravox_llm,  # Ultravox processes audio and generates intelligent responses
-            tts,  # Text-To-Speech (Indic Parler TTS per LLMTextFrame chunk)
+            tts,  # Text-To-Speech (Sarvam)
             transport.output(),  # Websocket output to Exotel
         ]
     )
@@ -508,7 +408,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info("Client connected to Exotel bot with Ultravox LLM")
+        logger.info("Client connected to Exotel bot with Ultravox LLM and Sarvam TTS")
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
