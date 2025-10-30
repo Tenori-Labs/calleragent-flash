@@ -1,11 +1,15 @@
-pipecat-ai
-fastapi
-uvicorn[standard]
-pyngrok
-python-dotenv
-loguru
-
-git+https://github.com/huggingface/parler-tts.git
+pipecat-ai[websocket,cartesia,openai,silero,deepgram,runner,ultravox]>=0.0.85
+pipecatcloud>=0.2.4
+huggingface_hub>=0.20.0
 transformers>=4.41.0
-numpy>=1.24
+torch>=2.0.0
+numpy>=1.21.0
+pyngrok>=7.0.0
+uvicorn>=0.24.0
+fastapi>=0.104.0
+loguru
+python-dotenv
+
+# Indic Parler TTS
+git+https://github.com/huggingface/parler-tts.git
 soundfile>=0.12.1
