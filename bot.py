@@ -358,6 +358,9 @@ ultravox_llm = UltravoxLLMService(
         "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!\n\n"
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
         "ABSOLUTELY NO EMOJIS - This is critical for the TTS system to work properly.\n\n"
+        "REMEMBER CAREFULLY!!!"
+        "VERY VERY VERY IMMPORTANT: When you generate a response in Tanglish, English words should ONLY be in English, and Tamil words should ONLY be in Tamil."
+        "EXAMPLE: Okay, games ஆ? எந்த மாதிரி games உங்களுக்கு பிடிக்கும்? Action games வேணுமா, இல்ல puzzle games ஆ?"
     ),
     temperature=0.3,
     max_tokens=200,
@@ -375,9 +378,9 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
     tts = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
         model="bulbul:v2",
-        voice_id="anushka",
+        voice_id="vidhya",
         target_language_code="ta-IN",  # Tamil - India
-        pace=1.1,  # Slightly faster pace for quicker response
+        pace=1.0,  # Slightly faster pace for quicker response
         pitch=0,
         loudness=1.0,
         enable_preprocessing=True,
