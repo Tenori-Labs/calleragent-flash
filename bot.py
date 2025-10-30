@@ -322,10 +322,14 @@ class IndicParlerTTSService(FrameProcessor):
         self.device = device or ("cuda:0" if (hasattr(np, "__version__") and __import__("torch").cuda.is_available()) else "cpu")
 
         # Load TTS model/tokenizers
-        self.model = ParlerTTSForConditionalGeneration.from_pretrained(model_name).to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = ParlerTTSForConditionalGeneration.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        ).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.description_tokenizer = AutoTokenizer.from_pretrained(
             self.model.config.text_encoder._name_or_path
+            , trust_remote_code=True
         )
 
         # Voice prompt/description
