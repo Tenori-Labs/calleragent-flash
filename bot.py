@@ -386,8 +386,8 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=16000,  # Exotel telephony sample rate
-            audio_out_sample_rate=16000,  # Exotel telephony sample rate
+            audio_in_sample_rate=8000,  # Exotel telephony sample rate
+            audio_out_sample_rate=8000,  # Exotel telephony sample rate
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
