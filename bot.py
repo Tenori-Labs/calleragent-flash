@@ -378,7 +378,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
     tts = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
         model="bulbul:v2",
-        voice_id="vidhya",
+        voice_id="vidya",
         target_language_code="ta-IN",  # Tamil - India
         pace=1.0,  # Slightly faster pace for quicker response
         pitch=0,
