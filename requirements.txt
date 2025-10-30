@@ -1,0 +1,11 @@
+pipecat-ai
+fastapi
+uvicorn[standard]
+pyngrok
+python-dotenv
+loguru
+
+git+https://github.com/huggingface/parler-tts.git
+transformers>=4.41.0
+numpy>=1.24
+soundfile>=0.12.1
