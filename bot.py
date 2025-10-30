@@ -80,28 +80,53 @@ def setup_ngrok_proxy():
 
 
 class UltravoxLLMService(UltravoxSTTService):
-    """Extended Ultravox service that supports system prompts and acts as a full LLM."""
+    """Extended Ultravox service that supports system prompts and acts as a full LLM with conversation memory."""
     
-    def __init__(self, system_prompt: str = None, max_conversation_turns: int = 5, **kwargs):
+    def __init__(self, system_prompt: str = None, max_conversation_turns: int = 10, **kwargs):
         super().__init__(**kwargs)
         self._system_prompt = system_prompt or "You are a helpful assistant."
-        self._conversation_messages = []  # Store text-based conversation history
-        self._current_user_transcription = ""  # Store the current user's speech as text
+        self._conversation_history = []  # Store structured conversation turns
         self._max_conversation_turns = max_conversation_turns
         self._error_count = 0
-        logger.info(f"Initialized UltravoxLLMService with system prompt and conversation memory")
+        logger.info(f"Initialized UltravoxLLMService with conversation memory (max {max_conversation_turns} turns)")
     
     def _manage_conversation_history(self):
         """Keep conversation history within limits to prevent memory issues."""
-        # Keep only the last N turns (user + assistant pairs)
-        max_messages = self._max_conversation_turns * 2  # Each turn has user + assistant
-        if len(self._conversation_messages) > max_messages:
-            # Remove oldest messages, keeping the most recent ones
-            self._conversation_messages = self._conversation_messages[-max_messages:]
-            logger.info(f"Trimmed conversation history to {len(self._conversation_messages)} messages")
+        if len(self._conversation_history) > self._max_conversation_turns:
+            # Remove oldest turns, keeping the most recent ones
+            removed_count = len(self._conversation_history) - self._max_conversation_turns
+            self._conversation_history = self._conversation_history[-self._max_conversation_turns:]
+            logger.info(f"Trimmed conversation history: removed {removed_count} old turns, kept {len(self._conversation_history)} recent turns")
+    
+    def _build_context_messages(self, audio_float32):
+        """Build the message list for Ultravox with conversation history."""
+        import numpy as np
+        
+        # Start with system prompt that includes conversation context
+        if self._conversation_history:
+            # Build a text summary of previous conversation
+            context_text = "Previous conversation context:\n"
+            for i, turn in enumerate(self._conversation_history, 1):
+                context_text += f"\nTurn {i}:\n"
+                context_text += f"User said: {turn['user']}\n"
+                context_text += f"You responded: {turn['assistant']}\n"
+            
+            enhanced_system_prompt = f"{self._system_prompt}\n\n{context_text}\n\nNow respond to the current user's speech:"
+            logger.info(f"Built context with {len(self._conversation_history)} previous turns")
+        else:
+            enhanced_system_prompt = self._system_prompt
+            logger.info("No previous conversation history, using base system prompt")
+        
+        # Build messages in the format Ultravox expects
+        messages = [
+            {"role": "system", "content": enhanced_system_prompt},
+            {"role": "user", "content": "<|audio|>"}  # Ultravox will replace this with audio
+        ]
+        
+        return messages
     
     async def _process_audio_buffer(self) -> AsyncGenerator[Frame, None]:
-        """Process collected audio frames with Ultravox using system prompt."""
+        """Process collected audio frames with Ultravox using system prompt and conversation history."""
         try:
             self._buffer.is_processing = True
 
@@ -109,13 +134,14 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.warning("No audio frames to process")
                 return
 
-            # Process audio frames
+            # Process audio frames with minimal manipulation to preserve quality
+            import numpy as np
             audio_arrays = []
+            
             for f in self._buffer.frames:
                 if hasattr(f, "audio") and f.audio:
                     if isinstance(f.audio, bytes):
                         try:
-                            import numpy as np
                             arr = np.frombuffer(f.audio, dtype=np.int16)
                             if arr.size > 0:
                                 audio_arrays.append(arr)
@@ -123,6 +149,7 @@ class UltravoxLLMService(UltravoxSTTService):
                             logger.error(f"Error processing bytes audio frame: {e}")
                     elif isinstance(f.audio, np.ndarray):
                         if f.audio.size > 0:
+                            # Ensure correct dtype
                             if f.audio.dtype != np.int16:
                                 audio_arrays.append(f.audio.astype(np.int16))
                             else:
@@ -132,58 +159,43 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.warning("No valid audio data found in frames")
                 return
 
-            # Concatenate and convert audio
-            import numpy as np
-            audio_data = np.concatenate(audio_arrays)
-            audio_int16 = audio_data
+            # Concatenate audio
+            audio_int16 = np.concatenate(audio_arrays)
+            
+            # Convert to float32 for the model (normalize properly)
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
             
-            # Validate and clean audio data
+            # Validate audio data
             if len(audio_float32) == 0:
                 logger.warning("Empty audio data, skipping processing")
                 return
             
-            # Ensure audio is within reasonable bounds
+            # Check for invalid values
             if np.any(np.isnan(audio_float32)) or np.any(np.isinf(audio_float32)):
                 logger.warning("Invalid audio data (NaN/Inf), skipping processing")
                 return
             
-            # Limit audio length to prevent memory issues and CUDA errors
-            max_audio_length = int(16000 * 5)  # 5 seconds max
-            if len(audio_float32) > max_audio_length:
-                audio_float32 = audio_float32[:max_audio_length]
-                logger.info(f"Truncated audio to {max_audio_length} samples")
+            # Clip values to valid range [-1.0, 1.0]
+            audio_float32 = np.clip(audio_float32, -1.0, 1.0)
             
-            # Ensure audio is not too short (at least 0.5 seconds)
-            min_audio_length = int(16000 * 0.5)  # 0.5 seconds min
+            # More reasonable length limits - don't cut speech too aggressively
+            max_audio_length = int(16000 * 15)  # 15 seconds max (increased from 5)
+            min_audio_length = int(16000 * 0.3)  # 0.3 seconds min (decreased from 0.5)
+            
+            if len(audio_float32) > max_audio_length:
+                logger.warning(f"Audio too long ({len(audio_float32)/16000:.1f}s), truncating to {max_audio_length/16000:.1f}s")
+                audio_float32 = audio_float32[:max_audio_length]
+            
             if len(audio_float32) < min_audio_length:
-                # Pad with silence
-                padding_length = int(min_audio_length - len(audio_float32))
+                logger.warning(f"Audio too short ({len(audio_float32)/16000:.2f}s), padding to {min_audio_length/16000:.2f}s")
+                padding_length = min_audio_length - len(audio_float32)
                 padding = np.zeros(padding_length, dtype=np.float32)
                 audio_float32 = np.concatenate([audio_float32, padding])
-                logger.info(f"Padded audio to {len(audio_float32)} samples")
 
-            # Build messages for Ultravox model
-            # FIXED: Build conversation context into the system prompt instead of adding as separate message
-            system_prompt_with_context = self._system_prompt
-            
-            if self._conversation_messages:
-                # Add conversation history to system prompt
-                context = "\n\nPrevious conversation:\n"
-                for msg in self._conversation_messages:
-                    role = msg["role"].capitalize()
-                    content = msg["content"]
-                    context += f"{role}: {content}\n"
-                
-                system_prompt_with_context += context
-                logger.info(f"Added conversation context with {len(self._conversation_messages)} previous messages to system prompt")
-            
-            messages_for_model = [
-                {"role": "system", "content": system_prompt_with_context},
-                {"role": "user", "content": "<|audio|>\n"}
-            ]
+            logger.info(f"Processing audio: {len(audio_float32)/16000:.2f} seconds, {len(audio_float32)} samples")
 
-            logger.info(f"Generating response with {len(messages_for_model)} messages in context")
+            # Build messages with conversation context
+            messages_for_model = self._build_context_messages(audio_float32)
 
             # Generate text using the model
             if self._model:
@@ -201,24 +213,8 @@ class UltravoxLLMService(UltravoxSTTService):
                     yield LLMFullResponseStartFrame()
 
                     full_response = ""
-                    user_speech = ""  # Will extract the user's speech from the response
-                    first_chunk_received = False
                     
-                    # Add debugging information
-                    logger.info(f"Audio shape: {audio_float32.shape}, dtype: {audio_float32.dtype}")
-                    logger.info(f"Messages count: {len(messages_for_model)}")
-                    
-                    # Ensure audio is in the correct format
-                    if len(audio_float32) == 0:
-                        logger.warning("Empty audio data, using placeholder")
-                        audio_float32 = np.zeros(16000, dtype=np.float32)  # 1 second of silence
-                    
-                    # Limit audio length to prevent memory issues
-                    max_audio_length = int(16000 * 10)  # 10 seconds max
-                    if len(audio_float32) > max_audio_length:
-                        audio_float32 = audio_float32[:max_audio_length]
-                        logger.info(f"Truncated audio to {max_audio_length} samples")
-                    
+                    # Generate response from Ultravox
                     async for response in self._model.generate(
                         messages=messages_for_model,
                         temperature=self._temperature,
@@ -239,27 +235,31 @@ class UltravoxLLMService(UltravoxSTTService):
                     await self.stop_processing_metrics()
                     yield LLMFullResponseEndFrame()
 
-                    # Store the conversation in history as TEXT (not audio placeholders)
-                    # The model generates responses that implicitly understand what was said
-                    # We'll store a placeholder for user input and the actual response
+                    # Extract user transcription and store conversation turn
+                    # Ultravox implicitly transcribes the audio and responds to it
+                    # We can infer what the user said from the context, but for a proper
+                    # conversation history, we should note that audio was provided
                     
-                    # Add user message (we don't have transcription, but we can infer from response)
-                    # For now, use a placeholder that indicates audio was provided
-                    if full_response:
-                        # Only store conversation if we got a valid response
-                        user_placeholder = "[User spoke via audio]"
-                        self._conversation_messages.append({"role": "user", "content": user_placeholder})
-                        self._conversation_messages.append({"role": "assistant", "content": full_response})
+                    if full_response.strip():
+                        # For better conversation tracking, we create a placeholder
+                        # In a production system, you might want to use a separate STT service
+                        # to get the actual transcription for history
+                        user_speech_placeholder = "[Audio input received]"
                         
-                        logger.info(f"Stored conversation turn in history (total: {len(self._conversation_messages)} messages)")
+                        # Store the conversation turn
+                        self._conversation_history.append({
+                            "user": user_speech_placeholder,
+                            "assistant": full_response.strip()
+                        })
+                        
+                        logger.info(f"Stored conversation turn. Total history: {len(self._conversation_history)} turns")
+                        logger.info(f"Assistant response: {full_response[:100]}...")
+                        
+                        # Manage history size
+                        self._manage_conversation_history()
                     
                     # Reset error count on successful generation
                     self._error_count = 0
-                    
-                    # Manage conversation history size
-                    self._manage_conversation_history()
-
-                    logger.info(f"Generated response: {full_response[:100]}...")
 
                 except Exception as e:
                     logger.error(f"Error generating text from model: {e}")
@@ -269,28 +269,27 @@ class UltravoxLLMService(UltravoxSTTService):
                     # Increment error count
                     self._error_count += 1
                     
-                    # If too many errors, reset conversation history
+                    # If too many consecutive errors, reset conversation history
                     if self._error_count >= 3:
-                        logger.warning("Too many errors, resetting conversation history")
-                        self._conversation_messages = []
+                        logger.warning(f"Too many consecutive errors ({self._error_count}), resetting conversation history")
+                        self._conversation_history = []
                         self._error_count = 0
                     
-                    # Try to provide a fallback response
-                    fallback_response = "I'm sorry, I encountered a technical issue. Could you please try again?"
-                    from pipecat.frames.frames import ErrorFrame, LLMTextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame
+                    # Provide a fallback response
+                    fallback_response = "மன்னிக்கவும், ஏதோ technical issue வந்துச்சு. மறுபடியும் சொல்லுங்க?"
+                    from pipecat.frames.frames import LLMTextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame
                     
                     yield LLMFullResponseStartFrame()
                     yield LLMTextFrame(text=fallback_response)
                     yield LLMFullResponseEndFrame()
                     
-                    # Don't store this as conversation history since it's an error
             else:
-                logger.warning("No model available for text generation")
+                logger.error("No model available for text generation")
                 from pipecat.frames.frames import ErrorFrame
                 yield ErrorFrame("No model available for text generation")
 
         except Exception as e:
-            logger.error(f"Error processing audio buffer: {e}")
+            logger.error(f"Error in audio buffer processing: {e}")
             import traceback
             logger.error(traceback.format_exc())
             from pipecat.frames.frames import ErrorFrame
@@ -307,7 +306,7 @@ ultravox_llm = UltravoxLLMService(
     hf_token=os.getenv("HF_TOKEN"),
     system_prompt=(
         "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words.\n"
-        "Speak in an EXTREMELY CONCISE manner"
+        "Speak in an EXTREMELY CONCISE manner.\n"
         "Use TAMIL literals for generating Tamil words and English literals for English words.\n\n"
 
         "You are a helpful AI assistant in a phone call. Your goal is to demonstrate "
@@ -316,12 +315,11 @@ ultravox_llm = UltravoxLLMService(
         "Respond to what the user said in a creative and helpful way.\n\n"
 
         "IMPORTANT - CONVERSATION MEMORY:\n"
-        "- You will see 'Previous conversation:' sections showing what was said before.\n"
-        "- ALWAYS read and remember ALL information from previous exchanges.\n"
-        "- Use this context to provide relevant, connected responses.\n"
-        "- If the user asks about something mentioned earlier, recall it from the conversation history.\n"
-        "- Reference previous topics naturally to show you remember the conversation.\n"
-        "- Treat the entire call as ONE continuous conversation, not separate interactions.\n\n"
+        "- You can see previous conversation turns in the context above.\n"
+        "- ALWAYS remember and reference information from earlier in the conversation.\n"
+        "- Use context naturally to provide relevant, connected responses.\n"
+        "- If the user asks about something mentioned earlier, recall it accurately.\n"
+        "- Treat the entire call as ONE continuous conversation.\n\n"
 
         "ADDITIONAL INSTRUCTIONS (COLLOQUIAL TAMIL MODE):\n"
         "- Speak in a mix of Tamil and English words (Tanglish) in a friendly, casual tone.\n"
@@ -355,11 +353,12 @@ ultravox_llm = UltravoxLLMService(
         "Remember: Mix Tamil and English naturally, keep it friendly and human, like a real phone chat between buddies.\n\n"
 
         "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!\n\n"
-        "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated\n\n"
+        "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
     ),
     temperature=0.6,
-    max_tokens=150,
-    gpu_memory_utilization=0.9,
+    max_tokens=200,  # Increased slightly for better responses
+    max_conversation_turns=10,  # Keep last 10 turns
+    gpu_memory_utilization=0.85,  # Slightly reduced to prevent OOM
     max_model_len=4096,
     dtype="bfloat16",
     enforce_eager=False,
@@ -419,13 +418,19 @@ async def bot(runner_args: RunnerArguments):
         call_sid=call_data["call_id"],
     )
 
+    # IMPROVED VAD settings - less aggressive to avoid cutting off speech
     transport = FastAPIWebsocketTransport(
         websocket=runner_args.websocket,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    stop_secs=0.5,  # Increased from 0.2 to avoid cutting off speech
+                    min_volume=0.6,  # Lower threshold for better sensitivity
+                )
+            ),
             serializer=serializer,
         ),
     )
