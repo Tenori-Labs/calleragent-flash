@@ -126,7 +126,7 @@ class UltravoxLLMService(UltravoxSTTService):
         return messages
     
     async def _process_audio_buffer(self) -> AsyncGenerator[Frame, None]:
-        """Process collected audio frames with improved audio quality and listening."""
+        """Process collected audio frames with Ultravox using system prompt and conversation history."""
         try:
             self._buffer.is_processing = True
 
@@ -134,8 +134,8 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.warning("No audio frames to process")
                 return
 
+            # Process audio frames with minimal manipulation to preserve quality
             import numpy as np
-            from scipy import signal
             audio_arrays = []
             
             for f in self._buffer.frames:
@@ -149,6 +149,7 @@ class UltravoxLLMService(UltravoxSTTService):
                             logger.error(f"Error processing bytes audio frame: {e}")
                     elif isinstance(f.audio, np.ndarray):
                         if f.audio.size > 0:
+                            # Ensure correct dtype
                             if f.audio.dtype != np.int16:
                                 audio_arrays.append(f.audio.astype(np.int16))
                             else:
@@ -161,7 +162,7 @@ class UltravoxLLMService(UltravoxSTTService):
             # Concatenate audio
             audio_int16 = np.concatenate(audio_arrays)
             
-            # Convert to float32 (normalize properly)
+            # Convert to float32 for the model (normalize properly)
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
             
             # Validate audio data
@@ -169,51 +170,29 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.warning("Empty audio data, skipping processing")
                 return
             
+            # Check for invalid values
             if np.any(np.isnan(audio_float32)) or np.any(np.isinf(audio_float32)):
                 logger.warning("Invalid audio data (NaN/Inf), skipping processing")
                 return
             
-            # === IMPROVED AUDIO PROCESSING ===
-            
-            # 1. Remove DC offset
-            audio_float32 = audio_float32 - np.mean(audio_float32)
-            
-            # 2. Normalize to use full dynamic range
-            max_val = np.max(np.abs(audio_float32))
-            if max_val > 0:
-                audio_float32 = audio_float32 / max_val
-            
-            # 3. Apply pre-emphasis filter (enhances speech frequencies)
-            pre_emphasis = 0.97
-            audio_float32 = np.append(audio_float32[0], audio_float32[1:] - pre_emphasis * audio_float32[:-1])
-            
-            # 4. High-pass filter to remove low-frequency noise
-            try:
-                sos = signal.butter(3, 100, 'hp', fs=16000, output='sos')
-                audio_float32 = signal.sosfilt(sos, audio_float32).astype(np.float32)
-            except Exception as e:
-                logger.warning(f"Could not apply high-pass filter: {e}")
-            
-            # 5. Clip to valid range
+            # Clip values to valid range [-1.0, 1.0]
             audio_float32 = np.clip(audio_float32, -1.0, 1.0)
             
-            # Better length limits - allow longer speech
-            max_audio_length = int(16000 * 20)  # 20 seconds max
-            min_audio_length = int(16000 * 0.2)  # 0.2 seconds min
+            # More reasonable length limits - don't cut speech too aggressively
+            max_audio_length = int(16000 * 15)  # 15 seconds max (increased from 5)
+            min_audio_length = int(16000 * 0.3)  # 0.3 seconds min (decreased from 0.5)
             
             if len(audio_float32) > max_audio_length:
-                logger.warning(f"Audio too long ({len(audio_float32)/16000:.1f}s), truncating")
+                logger.warning(f"Audio too long ({len(audio_float32)/16000:.1f}s), truncating to {max_audio_length/16000:.1f}s")
                 audio_float32 = audio_float32[:max_audio_length]
             
             if len(audio_float32) < min_audio_length:
-                logger.warning(f"Audio too short ({len(audio_float32)/16000:.2f}s), padding")
+                logger.warning(f"Audio too short ({len(audio_float32)/16000:.2f}s), padding to {min_audio_length/16000:.2f}s")
                 padding_length = min_audio_length - len(audio_float32)
-                audio_float32 = np.concatenate([audio_float32, np.zeros(padding_length, dtype=np.float32)])
+                padding = np.zeros(padding_length, dtype=np.float32)
+                audio_float32 = np.concatenate([audio_float32, padding])
 
-            # Log audio quality metrics
-            rms = np.sqrt(np.mean(audio_float32**2))
-            logger.info(f"Processing audio: {len(audio_float32)/16000:.2f}s | "
-                       f"RMS: {rms:.3f} | Min: {np.min(audio_float32):.3f} | Max: {np.max(audio_float32):.3f}")
+            logger.info(f"Processing audio: {len(audio_float32)/16000:.2f} seconds, {len(audio_float32)} samples")
 
             # Build messages with conversation context
             messages_for_model = self._build_context_messages(audio_float32)
@@ -256,9 +235,18 @@ class UltravoxLLMService(UltravoxSTTService):
                     await self.stop_processing_metrics()
                     yield LLMFullResponseEndFrame()
 
+                    # Extract user transcription and store conversation turn
+                    # Ultravox implicitly transcribes the audio and responds to it
+                    # We can infer what the user said from the context, but for a proper
+                    # conversation history, we should note that audio was provided
+                    
                     if full_response.strip():
+                        # For better conversation tracking, we create a placeholder
+                        # In a production system, you might want to use a separate STT service
+                        # to get the actual transcription for history
                         user_speech_placeholder = "[Audio input received]"
                         
+                        # Store the conversation turn
                         self._conversation_history.append({
                             "user": user_speech_placeholder,
                             "assistant": full_response.strip()
@@ -266,8 +254,11 @@ class UltravoxLLMService(UltravoxSTTService):
                         
                         logger.info(f"Stored conversation turn. Total history: {len(self._conversation_history)} turns")
                         logger.info(f"Assistant response: {full_response[:100]}...")
+                        
+                        # Manage history size
                         self._manage_conversation_history()
                     
+                    # Reset error count on successful generation
                     self._error_count = 0
 
                 except Exception as e:
@@ -275,13 +266,16 @@ class UltravoxLLMService(UltravoxSTTService):
                     import traceback
                     logger.error(f"Full traceback: {traceback.format_exc()}")
                     
+                    # Increment error count
                     self._error_count += 1
                     
+                    # If too many consecutive errors, reset conversation history
                     if self._error_count >= 3:
-                        logger.warning(f"Too many consecutive errors ({self._error_count}), resetting")
+                        logger.warning(f"Too many consecutive errors ({self._error_count}), resetting conversation history")
                         self._conversation_history = []
                         self._error_count = 0
                     
+                    # Provide a fallback response
                     fallback_response = "மன்னிக்கவும், ஏதோ technical issue வந்துச்சு. மறுபடியும் சொல்லுங்க?"
                     from pipecat.frames.frames import LLMTextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame
                     
@@ -368,8 +362,8 @@ ultravox_llm = UltravoxLLMService(
         "VERY VERY VERY IMMPORTANT: When you generate a response in Tanglish, English words should ONLY be in English, and Tamil words should ONLY be in Tamil."
         "EXAMPLE: Okay, games ஆ? எந்த மாதிரி games உங்களுக்கு பிடிக்கும்? Action games வேணுமா, இல்ல puzzle games ஆ?"
     ),
-    temperature=0.3,  # Reduced from 0.3 for more consistent responses
-    max_tokens=150,  # Slightly reduced for faster responses
+    temperature=0.3,
+    max_tokens=200,
     max_conversation_turns=10,
     gpu_memory_utilization=0.85,
     max_model_len=4096,
@@ -386,13 +380,13 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
         model="bulbul:v2",
         voice_id="vidya",
         target_language_code="ta-IN",  # Tamil - India
-        pace=1.0,
+        pace=1.0,  # Slightly faster pace for quicker response
         pitch=0,
         loudness=1.0,
         enable_preprocessing=True,
-        # Streaming optimization parameters - improved for faster response
-        min_buffer_size=15,  # Reduced from 20 for faster initial response
-        max_chunk_length=80,  # Reduced from 100 for more frequent chunks
+        # Streaming optimization parameters
+        min_buffer_size=20,  # Reduced from default 50 for faster initial response
+        max_chunk_length=100,  # Reduced from default 200 for more frequent chunks
     )
 
     # Create pipeline with Ultravox as the central multimodal LLM
@@ -440,7 +434,7 @@ async def bot(runner_args: RunnerArguments):
         call_sid=call_data["call_id"],
     )
 
-    # IMPROVED VAD settings - optimized for better speech detection
+    # IMPROVED VAD settings - less aggressive to avoid cutting off speech
     transport = FastAPIWebsocketTransport(
         websocket=runner_args.websocket,
         params=FastAPIWebsocketParams(
@@ -449,9 +443,8 @@ async def bot(runner_args: RunnerArguments):
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.5,  # Increased from 0.5 - wait longer before deciding speech stopped
-                    min_volume=0.3,  # Reduced from 0.6 - more sensitive to quieter speech
-                    start_secs=0.15,  # Wait time before starting speech detection
+                    stop_secs=0.5,  # Increased from 0.2 to avoid cutting off speech
+                    min_volume=0.6,  # Lower threshold for better sensitivity
                 )
             ),
             serializer=serializer,
