@@ -33,11 +33,11 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, LLMMessagesFrame
+from pipecat.frames.frames import Frame, LLMMessagesFrame, CancelFrame, EndFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import parse_telephony_websocket
 from pipecat.serializers.exotel import ExotelFrameSerializer
@@ -88,6 +88,8 @@ class UltravoxLLMService(UltravoxSTTService):
         self._conversation_history = []
         self._max_conversation_turns = max_conversation_turns
         self._error_count = 0
+        self._is_generating = False  # Track if currently generating
+        self._should_cancel = False  # Flag for cancellation
         logger.info(f"Initialized UltravoxLLMService with conversation memory (max {max_conversation_turns} turns)")
     
     def _manage_conversation_history(self):
@@ -128,6 +130,13 @@ class UltravoxLLMService(UltravoxSTTService):
 
             if not self._buffer.frames:
                 logger.warning("No audio frames to process")
+                return
+
+            # Check if we should cancel (user interrupted)
+            if self._should_cancel:
+                logger.info("Cancelling previous generation due to interruption")
+                self._should_cancel = False
+                self._is_generating = False
                 return
 
             import numpy as np
@@ -187,12 +196,21 @@ class UltravoxLLMService(UltravoxSTTService):
             rms = np.sqrt(np.mean(audio_float32**2))
             logger.info(f"Processing audio: {len(audio_float32)/16000:.2f}s | RMS: {rms:.3f}")
 
+            # If currently generating, cancel it
+            if self._is_generating:
+                logger.info("User interrupted! Cancelling ongoing generation")
+                self._should_cancel = True
+                from pipecat.frames.frames import CancelFrame
+                yield CancelFrame()
+                return
+
             # Build messages with conversation context
             messages_for_model = self._build_context_messages(audio_float32)
 
             # Generate text using the model
             if self._model:
                 try:
+                    self._is_generating = True
                     await self.start_ttfb_metrics()
                     await self.start_processing_metrics()
 
@@ -214,6 +232,14 @@ class UltravoxLLMService(UltravoxSTTService):
                         max_tokens=self._max_tokens,
                         audio=audio_float32,
                     ):
+                        # Check for cancellation during generation
+                        if self._should_cancel:
+                            logger.info("Generation cancelled mid-stream")
+                            self._should_cancel = False
+                            self._is_generating = False
+                            yield LLMFullResponseEndFrame()
+                            return
+
                         await self.stop_ttfb_metrics()
 
                         chunk = json.loads(response)
@@ -227,6 +253,7 @@ class UltravoxLLMService(UltravoxSTTService):
 
                     await self.stop_processing_metrics()
                     yield LLMFullResponseEndFrame()
+                    self._is_generating = False
 
                     if full_response.strip():
                         user_speech_placeholder = "[Audio input received]"
@@ -243,6 +270,7 @@ class UltravoxLLMService(UltravoxSTTService):
                     self._error_count = 0
 
                 except Exception as e:
+                    self._is_generating = False
                     logger.error(f"Error generating text from model: {e}")
                     import traceback
                     logger.error(f"Full traceback: {traceback.format_exc()}")
@@ -267,6 +295,7 @@ class UltravoxLLMService(UltravoxSTTService):
                 yield ErrorFrame("No model available for text generation")
 
         except Exception as e:
+            self._is_generating = False
             logger.error(f"Error in audio buffer processing: {e}")
             import traceback
             logger.error(traceback.format_exc())
@@ -352,7 +381,7 @@ ultravox_llm = UltravoxLLMService(
 )
 
 async def run_bot(transport: BaseTransport, handle_sigint: bool):
-    # Initialize Sarvam TTS service
+    # Initialize Sarvam TTS service with interruption support
     tts = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
         model="bulbul:v2",
@@ -383,6 +412,8 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
             audio_out_sample_rate=16000,
             enable_metrics=True,
             enable_usage_metrics=True,
+            allow_interruptions=True,  # Enable interruptions
+            enable_usage_metrics=True,
         ),
     )
 
@@ -411,7 +442,7 @@ async def bot(runner_args: RunnerArguments):
         call_sid=call_data["call_id"],
     )
 
-    # BALANCED VAD settings - not too aggressive
+    # BALANCED VAD settings with interruption detection
     transport = FastAPIWebsocketTransport(
         websocket=runner_args.websocket,
         params=FastAPIWebsocketParams(
@@ -420,12 +451,15 @@ async def bot(runner_args: RunnerArguments):
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.5,  # Balanced - not too short, not too long
-                    min_volume=0.4,  # Balanced sensitivity
-                    start_secs=0.15,  # Wait a bit before starting
+                    stop_secs=0.6,  # Balanced - not too short, not too long
+                    min_volume=0.5,  # Balanced sensitivity
+                    start_secs=0.2,  # Wait a bit before starting
                 )
             ),
             serializer=serializer,
+            # Enable barge-in/interruption handling
+            audio_in_filter=None,
+            audio_out_filter=None,
         ),
     )
 
