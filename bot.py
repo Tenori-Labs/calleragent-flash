@@ -553,9 +553,9 @@ async def bot(runner_args: RunnerArguments):
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.6,  # Balanced - not too short, not too long
+                    stop_secs=0.4,  # Balanced - not too short, not too long
                     min_volume=0.5,  # Balanced sensitivity
-                    start_secs=0.2,  # Wait a bit before starting
+                    start_secs=0.3,  # Wait a bit before starting
                 )
             ),
             serializer=serializer,
