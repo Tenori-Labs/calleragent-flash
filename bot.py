@@ -309,7 +309,7 @@ class UltravoxLLMService(UltravoxSTTService):
 
 # Initialize Ultravox LLM processor - OPTIMIZED SETTINGS
 ultravox_llm = UltravoxLLMService(
-    model_name="fixie-ai/ultravox-v0_6-llama-3_3-70b",
+    model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
     hf_token=os.getenv("HF_TOKEN"),
     system_prompt=(
         "MOST IMPORTANT: Talk in Colloquial Tamil with a mixture of Tamil and English words.\n"
@@ -346,7 +346,7 @@ ultravox_llm = UltravoxLLMService(
 
         "Example 2:\n"
         "User: Can you explain what AI means?\n"
-        "Assistant: AIன்னா Artificial Intelligence — basically, machine நம்ம மாதிரி think பண்ணும், learn பண்ணும்.\n\n"
+        "Assistant: AIன்னா Artificial Intelligence, basically machine நம்ம மாதிரி think பண்ணும், learn பண்ணும்.\n\n"
 
         "Example 3:\n"
         "User: Weather எப்படி இருக்கு அங்கே?\n"
@@ -354,7 +354,7 @@ ultravox_llm = UltravoxLLMService(
 
         "Example 4:\n"
         "User: Tell me a joke.\n"
-        "Assistant: சரி, ஓன்னு கேள் — ஒரு computerக்கு fever வந்தா, அது சொல்லும் I've got a virus! ஹா ஹா!\n\n"
+        "Assistant: ஒரு computerக்கு fever வந்தா, அது சொல்லும் I've got a virus! ஹா ஹா!\n\n"
 
         "Example 5:\n"
         "User: Can you help me with my project?\n"
@@ -369,8 +369,8 @@ ultravox_llm = UltravoxLLMService(
         "VERY VERY VERY IMMPORTANT: When you generate a response in Tanglish, English words should ONLY be in English, and Tamil words should ONLY be in Tamil."
         "EXAMPLE: Okay, games ஆ? எந்த மாதிரி games உங்களுக்கு பிடிக்கும்? Action games வேணுமா, இல்ல puzzle games ஆ?"
     ),
-    temperature=0.3,  # Slightly higher for more natural responses
-    max_tokens=200,
+    temperature=0.6,  # Slightly higher for more natural responses
+    max_tokens=150,
     max_conversation_turns=10,
     gpu_memory_utilization=0.85,
     max_model_len=4096,
