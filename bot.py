@@ -8,6 +8,9 @@ import os
 import sys
 from typing import AsyncGenerator
 
+# CRITICAL: Set memory optimization BEFORE any imports
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Monkeypatch for HTTPMethod import compatibility
 if sys.version_info < (3, 11):
     import http
@@ -53,12 +56,12 @@ load_dotenv(override=True)
 # Deploy on cloud GPU providers like Cerebrium.ai for optimal performance.
 
 # Performance optimization environment variables
-os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "1"  # Enable Triton Flash Attention
-os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"  # Use Flash Attention backend
-os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # Disable for better performance
-os.environ["TORCH_USE_CUDA_DSA"] = "0"  # Disable for better performance
-os.environ["VLLM_USE_V2_BLOCK_MANAGER"] = "1"  # Use v2 block manager for better memory
-os.environ["VLLM_USE_RAY_SCHEDULER"] = "1"  # Use Ray scheduler for better performance
+os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "1"
+os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+os.environ["TORCH_USE_CUDA_DSA"] = "0"
+os.environ["VLLM_USE_V2_BLOCK_MANAGER"] = "1"
+os.environ["VLLM_USE_RAY_SCHEDULER"] = "1"
 
 # Setup ngrok proxy
 def setup_ngrok_proxy():
@@ -68,10 +71,7 @@ def setup_ngrok_proxy():
         logger.error("NGROK_AUTHTOKEN not found in environment variables")
         raise ValueError("NGROK_AUTHTOKEN is required for telephony transport")
     
-    # Set ngrok auth token
     ngrok.set_auth_token(ngrok_auth_token)
-    
-    # Create HTTP tunnel
     tunnel = ngrok.connect(7860, "http")
     proxy_url = tunnel.public_url
     
@@ -85,7 +85,7 @@ class UltravoxLLMService(UltravoxSTTService):
     def __init__(self, system_prompt: str = None, max_conversation_turns: int = 10, **kwargs):
         super().__init__(**kwargs)
         self._system_prompt = system_prompt or "You are a helpful assistant."
-        self._conversation_history = []  # Store structured conversation turns
+        self._conversation_history = []
         self._max_conversation_turns = max_conversation_turns
         self._error_count = 0
         logger.info(f"Initialized UltravoxLLMService with conversation memory (max {max_conversation_turns} turns)")
@@ -93,7 +93,6 @@ class UltravoxLLMService(UltravoxSTTService):
     def _manage_conversation_history(self):
         """Keep conversation history within limits to prevent memory issues."""
         if len(self._conversation_history) > self._max_conversation_turns:
-            # Remove oldest turns, keeping the most recent ones
             removed_count = len(self._conversation_history) - self._max_conversation_turns
             self._conversation_history = self._conversation_history[-self._max_conversation_turns:]
             logger.info(f"Trimmed conversation history: removed {removed_count} old turns, kept {len(self._conversation_history)} recent turns")
@@ -102,9 +101,7 @@ class UltravoxLLMService(UltravoxSTTService):
         """Build the message list for Ultravox with conversation history."""
         import numpy as np
         
-        # Start with system prompt that includes conversation context
         if self._conversation_history:
-            # Build a text summary of previous conversation
             context_text = "Previous conversation context:\n"
             for i, turn in enumerate(self._conversation_history, 1):
                 context_text += f"\nTurn {i}:\n"
@@ -117,16 +114,15 @@ class UltravoxLLMService(UltravoxSTTService):
             enhanced_system_prompt = self._system_prompt
             logger.info("No previous conversation history, using base system prompt")
         
-        # Build messages in the format Ultravox expects
         messages = [
             {"role": "system", "content": enhanced_system_prompt},
-            {"role": "user", "content": "<|audio|>"}  # Ultravox will replace this with audio
+            {"role": "user", "content": "<|audio|>"}
         ]
         
         return messages
     
     async def _process_audio_buffer(self) -> AsyncGenerator[Frame, None]:
-        """Process collected audio frames with improved audio quality and listening."""
+        """Process collected audio frames - SIMPLIFIED to avoid distortion."""
         try:
             self._buffer.is_processing = True
 
@@ -135,7 +131,6 @@ class UltravoxLLMService(UltravoxSTTService):
                 return
 
             import numpy as np
-            from scipy import signal
             audio_arrays = []
             
             for f in self._buffer.frames:
@@ -161,10 +156,10 @@ class UltravoxLLMService(UltravoxSTTService):
             # Concatenate audio
             audio_int16 = np.concatenate(audio_arrays)
             
-            # Convert to float32 (normalize properly)
+            # Simple, clean conversion to float32 - NO aggressive processing
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
             
-            # Validate audio data
+            # Basic validation only
             if len(audio_float32) == 0:
                 logger.warning("Empty audio data, skipping processing")
                 return
@@ -173,47 +168,24 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.warning("Invalid audio data (NaN/Inf), skipping processing")
                 return
             
-            # === IMPROVED AUDIO PROCESSING ===
-            
-            # 1. Remove DC offset
-            audio_float32 = audio_float32 - np.mean(audio_float32)
-            
-            # 2. Normalize to use full dynamic range
-            max_val = np.max(np.abs(audio_float32))
-            if max_val > 0:
-                audio_float32 = audio_float32 / max_val
-            
-            # 3. Apply pre-emphasis filter (enhances speech frequencies)
-            pre_emphasis = 0.97
-            audio_float32 = np.append(audio_float32[0], audio_float32[1:] - pre_emphasis * audio_float32[:-1])
-            
-            # 4. High-pass filter to remove low-frequency noise
-            try:
-                sos = signal.butter(3, 100, 'hp', fs=16000, output='sos')
-                audio_float32 = signal.sosfilt(sos, audio_float32).astype(np.float32)
-            except Exception as e:
-                logger.warning(f"Could not apply high-pass filter: {e}")
-            
-            # 5. Clip to valid range
+            # Simple clipping to valid range
             audio_float32 = np.clip(audio_float32, -1.0, 1.0)
             
-            # Better length limits - allow longer speech
-            max_audio_length = int(16000 * 20)  # 20 seconds max
-            min_audio_length = int(16000 * 0.2)  # 0.2 seconds min
+            # More lenient length limits
+            max_audio_length = int(16000 * 30)  # 30 seconds max
+            min_audio_length = int(16000 * 0.3)  # 0.3 seconds min
             
             if len(audio_float32) > max_audio_length:
-                logger.warning(f"Audio too long ({len(audio_float32)/16000:.1f}s), truncating")
+                logger.warning(f"Audio too long ({len(audio_float32)/16000:.1f}s), truncating to 30s")
                 audio_float32 = audio_float32[:max_audio_length]
             
             if len(audio_float32) < min_audio_length:
-                logger.warning(f"Audio too short ({len(audio_float32)/16000:.2f}s), padding")
-                padding_length = min_audio_length - len(audio_float32)
-                audio_float32 = np.concatenate([audio_float32, np.zeros(padding_length, dtype=np.float32)])
+                logger.warning(f"Audio too short ({len(audio_float32)/16000:.2f}s), skipping")
+                return  # Don't pad, just skip short audio
 
-            # Log audio quality metrics
+            # Log audio info
             rms = np.sqrt(np.mean(audio_float32**2))
-            logger.info(f"Processing audio: {len(audio_float32)/16000:.2f}s | "
-                       f"RMS: {rms:.3f} | Min: {np.min(audio_float32):.3f} | Max: {np.max(audio_float32):.3f}")
+            logger.info(f"Processing audio: {len(audio_float32)/16000:.2f}s | RMS: {rms:.3f}")
 
             # Build messages with conversation context
             messages_for_model = self._build_context_messages(audio_float32)
@@ -306,7 +278,7 @@ class UltravoxLLMService(UltravoxSTTService):
             self._buffer.started_at = None
 
 
-# Initialize Ultravox LLM processor with system prompt and performance optimizations
+# Initialize Ultravox LLM processor - OPTIMIZED SETTINGS
 ultravox_llm = UltravoxLLMService(
     model_name="fixie-ai/ultravox-v0_6-gemma-3-27b",
     hf_token=os.getenv("HF_TOKEN"),
@@ -368,8 +340,8 @@ ultravox_llm = UltravoxLLMService(
         "VERY VERY VERY IMMPORTANT: When you generate a response in Tanglish, English words should ONLY be in English, and Tamil words should ONLY be in Tamil."
         "EXAMPLE: Okay, games ஆ? எந்த மாதிரி games உங்களுக்கு பிடிக்கும்? Action games வேணுமா, இல்ல puzzle games ஆ?"
     ),
-    temperature=0.3,  # Reduced from 0.3 for more consistent responses
-    max_tokens=150,  # Slightly reduced for faster responses
+    temperature=0.3,  # Slightly higher for more natural responses
+    max_tokens=200,
     max_conversation_turns=10,
     gpu_memory_utilization=0.85,
     max_model_len=4096,
@@ -380,36 +352,35 @@ ultravox_llm = UltravoxLLMService(
 )
 
 async def run_bot(transport: BaseTransport, handle_sigint: bool):
-    # Initialize Sarvam TTS service with optimized streaming settings
+    # Initialize Sarvam TTS service
     tts = SarvamTTSService(
         api_key=os.getenv("SARVAM_API_KEY"),
         model="bulbul:v2",
         voice_id="vidya",
-        target_language_code="ta-IN",  # Tamil - India
+        target_language_code="ta-IN",
         pace=1.0,
         pitch=0,
         loudness=1.0,
         enable_preprocessing=True,
-        # Streaming optimization parameters - improved for faster response
-        min_buffer_size=15,  # Reduced from 20 for faster initial response
-        max_chunk_length=80,  # Reduced from 100 for more frequent chunks
+        min_buffer_size=20,
+        max_chunk_length=100,
     )
 
     # Create pipeline with Ultravox as the central multimodal LLM
     pipeline = Pipeline(
         [
-            transport.input(),  # Websocket input from Exotel
-            ultravox_llm,  # Ultravox processes audio and generates intelligent responses
-            tts,  # Text-To-Speech (Sarvam)
-            transport.output(),  # Websocket output to Exotel
+            transport.input(),
+            ultravox_llm,
+            tts,
+            transport.output(),
         ]
     )
 
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=16000,  # Exotel telephony sample rate
-            audio_out_sample_rate=16000,  # Exotel telephony sample rate
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=16000,
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
@@ -440,7 +411,7 @@ async def bot(runner_args: RunnerArguments):
         call_sid=call_data["call_id"],
     )
 
-    # IMPROVED VAD settings - optimized for better speech detection
+    # BALANCED VAD settings - not too aggressive
     transport = FastAPIWebsocketTransport(
         websocket=runner_args.websocket,
         params=FastAPIWebsocketParams(
@@ -449,9 +420,9 @@ async def bot(runner_args: RunnerArguments):
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.5,  # Increased from 0.5 - wait longer before deciding speech stopped
-                    min_volume=0.3,  # Reduced from 0.6 - more sensitive to quieter speech
-                    start_secs=0.15,  # Wait time before starting speech detection
+                    stop_secs=0.5,  # Balanced - not too short, not too long
+                    min_volume=0.4,  # Balanced sensitivity
+                    start_secs=0.15,  # Wait a bit before starting
                 )
             ),
             serializer=serializer,
@@ -488,7 +459,6 @@ if __name__ == "__main__":
         logger.info("WebSocket connection accepted from Exotel")
 
         try:
-            # Create runner arguments and run the bot
             runner_args = WebSocketRunnerArguments(websocket=websocket)
             runner_args.handle_sigint = False
 
