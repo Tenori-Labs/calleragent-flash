@@ -90,6 +90,7 @@ class UltravoxLLMService(UltravoxSTTService):
         self._error_count = 0
         self._is_generating = False  # Track if currently generating
         self._should_cancel = False  # Flag for cancellation
+        self._turn_counter = 0  # Track conversation turns
         logger.info(f"Initialized UltravoxLLMService with conversation memory (max {max_conversation_turns} turns)")
     
     def _manage_conversation_history(self):
@@ -123,6 +124,74 @@ class UltravoxLLMService(UltravoxSTTService):
         
         return messages
     
+    def _log_conversation_history(self):
+        """Log the complete conversation history for debugging."""
+        logger.info("=" * 80)
+        logger.info("CONVERSATION HISTORY DUMP")
+        logger.info("=" * 80)
+        if not self._conversation_history:
+            logger.info("(No conversation history yet)")
+        else:
+            for i, turn in enumerate(self._conversation_history, 1):
+                logger.info(f"\n--- Turn {i} ---")
+                logger.info(f"USER: {turn['user']}")
+                logger.info(f"ASSISTANT: {turn['assistant']}")
+        logger.info("=" * 80)
+    
+    def _log_audio_details(self, audio_float32):
+        """Log detailed audio statistics for debugging."""
+        import numpy as np
+        
+        logger.info("=" * 80)
+        logger.info("AUDIO INPUT DETAILS")
+        logger.info("=" * 80)
+        logger.info(f"Duration: {len(audio_float32)/16000:.3f} seconds")
+        logger.info(f"Sample rate: 16000 Hz")
+        logger.info(f"Total samples: {len(audio_float32)}")
+        logger.info(f"Data type: {audio_float32.dtype}")
+        logger.info(f"Min value: {np.min(audio_float32):.6f}")
+        logger.info(f"Max value: {np.max(audio_float32):.6f}")
+        logger.info(f"Mean value: {np.mean(audio_float32):.6f}")
+        logger.info(f"RMS (volume): {np.sqrt(np.mean(audio_float32**2)):.6f}")
+        logger.info(f"Peak amplitude: {np.max(np.abs(audio_float32)):.6f}")
+        
+        # Check for silence or very quiet audio
+        rms = np.sqrt(np.mean(audio_float32**2))
+        if rms < 0.01:
+            logger.warning(f"⚠️ AUDIO VERY QUIET! RMS={rms:.6f} - May not be recognized properly")
+        elif rms < 0.05:
+            logger.warning(f"⚠️ Audio somewhat quiet. RMS={rms:.6f}")
+        else:
+            logger.info(f"✓ Audio volume looks good. RMS={rms:.6f}")
+        
+        # Check for clipping
+        if np.max(np.abs(audio_float32)) > 0.95:
+            logger.warning(f"⚠️ AUDIO MAY BE CLIPPING! Peak={np.max(np.abs(audio_float32)):.6f}")
+        
+        logger.info("=" * 80)
+    
+    def _log_model_input(self, messages_for_model):
+        """Log the exact messages being sent to the Ultravox model."""
+        import json
+        
+        logger.info("=" * 80)
+        logger.info("MODEL INPUT MESSAGES")
+        logger.info("=" * 80)
+        for i, msg in enumerate(messages_for_model):
+            logger.info(f"\nMessage {i+1}:")
+            logger.info(f"Role: {msg['role']}")
+            content = msg['content']
+            if content == "<|audio|>":
+                logger.info(f"Content: <|audio|> (audio will be embedded here)")
+            else:
+                # Truncate long system prompts for readability
+                if len(content) > 500:
+                    logger.info(f"Content (truncated): {content[:500]}...")
+                    logger.info(f"(Full length: {len(content)} characters)")
+                else:
+                    logger.info(f"Content: {content}")
+        logger.info("=" * 80)
+    
     async def _process_audio_buffer(self) -> AsyncGenerator[Frame, None]:
         """Process collected audio frames - SIMPLIFIED to avoid distortion."""
         try:
@@ -141,6 +210,8 @@ class UltravoxLLMService(UltravoxSTTService):
 
             import numpy as np
             audio_arrays = []
+            
+            logger.info(f"Processing {len(self._buffer.frames)} audio frames from buffer")
             
             for f in self._buffer.frames:
                 if hasattr(f, "audio") and f.audio:
@@ -164,6 +235,7 @@ class UltravoxLLMService(UltravoxSTTService):
 
             # Concatenate audio
             audio_int16 = np.concatenate(audio_arrays)
+            logger.info(f"Concatenated {len(audio_arrays)} arrays into {len(audio_int16)} samples")
             
             # Simple, clean conversion to float32 - NO aggressive processing
             audio_float32 = audio_int16.astype(np.float32) / 32768.0
@@ -192,9 +264,8 @@ class UltravoxLLMService(UltravoxSTTService):
                 logger.warning(f"Audio too short ({len(audio_float32)/16000:.2f}s), skipping")
                 return  # Don't pad, just skip short audio
 
-            # Log audio info
-            rms = np.sqrt(np.mean(audio_float32**2))
-            logger.info(f"Processing audio: {len(audio_float32)/16000:.2f}s | RMS: {rms:.3f}")
+            # ===== DETAILED LOGGING OF AUDIO =====
+            self._log_audio_details(audio_float32)
 
             # If currently generating, cancel it
             if self._is_generating:
@@ -205,7 +276,18 @@ class UltravoxLLMService(UltravoxSTTService):
                 return
 
             # Build messages with conversation context
+            self._turn_counter += 1
+            logger.info(f"\n{'='*80}")
+            logger.info(f"PROCESSING TURN #{self._turn_counter}")
+            logger.info(f"{'='*80}")
+            
+            # Log current conversation history
+            self._log_conversation_history()
+            
             messages_for_model = self._build_context_messages(audio_float32)
+            
+            # Log the exact input being sent to model
+            self._log_model_input(messages_for_model)
 
             # Generate text using the model
             if self._model:
@@ -224,6 +306,9 @@ class UltravoxLLMService(UltravoxSTTService):
                     yield LLMFullResponseStartFrame()
 
                     full_response = ""
+                    chunk_count = 0
+                    
+                    logger.info("Starting model generation...")
                     
                     # Generate response from Ultravox
                     async for response in self._model.generate(
@@ -243,6 +328,12 @@ class UltravoxLLMService(UltravoxSTTService):
                         await self.stop_ttfb_metrics()
 
                         chunk = json.loads(response)
+                        chunk_count += 1
+                        
+                        # Log raw chunks for debugging (first few only to avoid spam)
+                        if chunk_count <= 3:
+                            logger.debug(f"Raw chunk {chunk_count}: {json.dumps(chunk, indent=2)}")
+                        
                         if "choices" in chunk and len(chunk["choices"]) > 0:
                             delta = chunk["choices"][0]["delta"]
                             if "content" in delta:
@@ -255,6 +346,16 @@ class UltravoxLLMService(UltravoxSTTService):
                     yield LLMFullResponseEndFrame()
                     self._is_generating = False
 
+                    logger.info(f"Model generation complete. Received {chunk_count} chunks.")
+                    
+                    # ===== LOG THE COMPLETE RESPONSE =====
+                    logger.info("=" * 80)
+                    logger.info("MODEL OUTPUT (FULL RESPONSE)")
+                    logger.info("=" * 80)
+                    logger.info(f"Response: {full_response}")
+                    logger.info(f"Length: {len(full_response)} characters")
+                    logger.info("=" * 80)
+
                     if full_response.strip():
                         user_speech_placeholder = "[Audio input received]"
                         
@@ -263,15 +364,16 @@ class UltravoxLLMService(UltravoxSTTService):
                             "assistant": full_response.strip()
                         })
                         
-                        logger.info(f"Stored conversation turn. Total history: {len(self._conversation_history)} turns")
-                        logger.info(f"Assistant response: {full_response[:100]}...")
+                        logger.info(f"✓ Stored conversation turn. Total history: {len(self._conversation_history)} turns")
                         self._manage_conversation_history()
+                    else:
+                        logger.warning("⚠️ Model returned empty response!")
                     
                     self._error_count = 0
 
                 except Exception as e:
                     self._is_generating = False
-                    logger.error(f"Error generating text from model: {e}")
+                    logger.error(f"❌ Error generating text from model: {e}")
                     import traceback
                     logger.error(f"Full traceback: {traceback.format_exc()}")
                     
@@ -365,6 +467,7 @@ ultravox_llm = UltravoxLLMService(
         "MOST VERY VERY IMPORTANT: The TAMIL should be MORE in your response THAN ENGLISH!!!!\n\n"
         "REMEMBER CAREFULLY: DO NOT EVER add a translating English phrase next to the colloquial tamil response you have generated.\n\n"
         "ABSOLUTELY NO EMOJIS - This is critical for the TTS system to work properly.\n\n"
+
         "REMEMBER CAREFULLY!!!"
         "VERY VERY VERY IMMPORTANT: When you generate a response in Tanglish, English words should ONLY be in English, and Tamil words should ONLY be in Tamil."
         "EXAMPLE: Okay, games ஆ? எந்த மாதிரி games உங்களுக்கு பிடிக்கும்? Action games வேணுமா, இல்ல puzzle games ஆ?"
