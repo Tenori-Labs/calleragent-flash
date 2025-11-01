@@ -413,7 +413,6 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
             enable_metrics=True,
             enable_usage_metrics=True,
             allow_interruptions=True,  # Enable interruptions
-            enable_usage_metrics=True,
         ),
     )
 
